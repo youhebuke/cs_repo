@@ -6,3 +6,9 @@ slides/node_modules/
 
 # Marp preview renders
 slides/preview.*.png
+
+# python-pptx build previews (LibreOffice-rendered)
+slides_v2/pv-*.png
+
+# Python cache
+**/__pycache__/
