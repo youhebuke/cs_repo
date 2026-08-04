@@ -761,11 +761,148 @@ def f_kcp():
     save(fig, "f_kcp.png")
 
 
+# =========================================================================
+# 27. Hybrid attention tradeoff (cost vs retrieval)
+# =========================================================================
+def f_hybrid_tradeoff():
+    fig, ax = plt.subplots(figsize=(9.5, 5.2), dpi=200)
+    fig.patch.set_facecolor(BG)
+    ax.axhspan(6.5, 10, xmin=0, xmax=0.45, color=GREEN, alpha=0.07)
+    ax.text(2.2, 9.3, "理想区\n(便宜 + 精确)", ha="center", color=GREEN, fontsize=11, weight="bold")
+    # three points
+    ax.scatter([9], [9.2], s=520, color=SLATE, zorder=5, edgecolor="white", lw=2)
+    ax.text(9, 8.2, "纯全局 softmax\n精确但最贵 O(T²)/KV O(T)", ha="center", fontsize=10.5, color=SLATE)
+    ax.scatter([1.5], [3], s=520, color=VIOLET, zorder=5, edgecolor="white", lw=2)
+    ax.text(1.9, 1.9, "纯线性 (KDA/GDN)\n便宜但检索有损", ha="center", fontsize=10.5, color=VIOLET)
+    ax.scatter([3.2], [7.3], s=760, color=TEAL, zorder=6, marker="*", edgecolor="white", lw=1.5)
+    ax.text(4.6, 7.6, "K3 混合 3 KDA : 1 MLA\n多数层便宜 + 每4层全局锚点", ha="left", fontsize=11, color=TEAL, weight="bold")
+    ax.annotate("", xy=(3.0, 7.1), xytext=(1.8, 3.4),
+                arrowprops=dict(arrowstyle="-|>", color=VIOLET, lw=1.6, ls="--"))
+    ax.annotate("", xy=(3.6, 7.4), xytext=(8.6, 9.0),
+                arrowprops=dict(arrowstyle="-|>", color=SLATE, lw=1.6, ls="--"))
+    ax.set_xlim(0, 10.5); ax.set_ylim(0, 10.5)
+    ax.set_xlabel("长序列成本  →  越右越贵", fontsize=12)
+    ax.set_ylabel("精确检索能力  →  越上越强", fontsize=12)
+    ax.set_title("为什么『混合』：把成本与检索解耦，逼近理想区", fontsize=13, weight="bold", color=INK)
+    ax.set_xticks([]); ax.set_yticks([]); ax.grid(alpha=0.15)
+    save(fig, "f_hybrid_tradeoff.png")
+
+
+# =========================================================================
+# 28. FlashKDA two-kernel pipeline + CHUNK=16
+# =========================================================================
+def f_flashkda():
+    fig, ax = new_ax(10, 5.0)
+    ax.text(50, 95, "FlashKDA：双 kernel 流水，把递归的低并行度藏起来",
+            ha="center", fontsize=13, weight="bold", color=INK)
+    # single kernel (bad)
+    ax.text(26, 84, "朴素单 kernel", ha="center", fontsize=11, color=RED, weight="bold")
+    box(ax, 6, 70, 22, 9, "token 并行", fc=TEAL, fs=10.5, rounding=0.06)
+    box(ax, 28, 70, 14, 9, "递归(闲置SM)", fc="#fca5a5", tc=INK, fs=9.5, rounding=0.06)
+    ax.text(24, 66, "token 阶段被低并行度递归卡住 → SM 大量闲置", ha="center", fontsize=9.5, color=RED)
+    # two kernels pipelined (good)
+    ax.text(26, 58, "FlashKDA 双 kernel 流水", ha="center", fontsize=11, color=GREEN, weight="bold")
+    box(ax, 6, 44, 30, 8, "K1 · token 并行\n门/归一/衰减/16×16 求逆", fc=TEAL, fs=9.5, rounding=0.05)
+    box(ax, 20, 34, 30, 8, "K2 · head 并行\n跨 chunk 递归 + 输出", fc=NAVY, fs=9.5, rounding=0.05)
+    ax.text(24, 28, "两阶段独立调优 + 重叠 → 端到端 ≥15% 提速", ha="center", fontsize=10, color=GREEN, weight="bold")
+    # CHUNK=16 panel
+    box(ax, 58, 30, 40, 52, "", fc=PANEL, rounding=0.03)
+    ax.text(78, 76, "CHUNK = 16 的三重动机", ha="center", fontsize=12, weight="bold", color=NAVY)
+    reasons = ["① 配合 lower-bounded decay：16-token\n     累积衰减落进 BF16，免复杂 rescale",
+               "② 16×16 求逆用 Neumann 级数直接展开\n     很便宜",
+               "③ 可映射到 SM80 的 MMA 指令 →\n     多种 NVIDIA GPU 可移植"]
+    for i, t in enumerate(reasons):
+        ax.text(60, 68 - i * 12, t, fontsize=10, color=INK, va="top")
+    ax.text(78, 33, "片上状态 bf16 省一半 shared memory", ha="center", fontsize=9, color=SLATE)
+    save(fig, "f_flashkda.png")
+
+
+# =========================================================================
+# 29. RL 3x3 experts -> MOPD merge
+# =========================================================================
+def f_rl_experts():
+    fig, ax = new_ax(10, 5.0)
+    ax.text(50, 95, "后训练：分域 × 分强度练 9 个专家 → 多教师蒸馏合并",
+            ha="center", fontsize=12.5, weight="bold", color=INK)
+    domains = ["通用", "通用 Agent", "编码 Agent"]
+    efforts = ["low", "high", "max"]
+    x0, y0, cw, ch = 12, 20, 15, 15
+    for r, dom in enumerate(domains):
+        ax.text(x0 - 2, y0 + (2 - r) * ch + ch / 2, dom, ha="right", va="center",
+                fontsize=10.5, color=INK, weight="bold")
+        for c, eff in enumerate(efforts):
+            x = x0 + c * cw; y = y0 + (2 - r) * ch
+            box(ax, x, y, cw - 2, ch - 2, eff, fc=[TEAL, NAVY, VIOLET][c], fs=10, rounding=0.06)
+    for c, eff in enumerate(efforts):
+        ax.text(x0 + c * cw + cw / 2 - 1, y0 + 3 * ch + 1, eff, ha="center", fontsize=10, color=SLATE, weight="bold")
+    ax.text(x0 + 1.5 * cw, y0 + 3 * ch + 6, "reasoning effort →", ha="center", fontsize=10, color=SLATE)
+    # arrow to merged model
+    arrow(ax, x0 + 3 * cw, y0 + 1.5 * ch, 78, y0 + 1.5 * ch, AMBER_D, 3, ms=22)
+    ax.text((x0 + 3 * cw + 78) / 2, y0 + 1.5 * ch + 4, "MOPD\n多教师蒸馏", ha="center", fontsize=10.5, color=AMBER_D, weight="bold")
+    box(ax, 78, y0 + ch * 0.7, 18, 16, "统一\nKimi K3", fc=AMBER, tc=INK, fs=13, rounding=0.05)
+    ax.text(50, 10, "RL FLOPs ↑ → 工具调用步数与综合能力同步增长（长程自主执行是学出来的）",
+            ha="center", fontsize=10.5, color=NAVY, weight="bold")
+    save(fig, "f_rl_experts.png")
+
+
+# =========================================================================
+# 30. Score vs cost frontier
+# =========================================================================
+def f_cost():
+    fig, ax = plt.subplots(figsize=(9.5, 5.0), dpi=200)
+    fig.patch.set_facecolor(BG)
+    # illustrative points: (cost, score, name, color)
+    pts = [(2.03, 91.2, "Kimi K3", TEAL),
+           (4.1, 90.4, "GPT-5.6 Sol", SLATE),
+           (22, 88.0, "Claude Fable 5", VIOLET),
+           (18, 84.3, "Claude Opus 4.8", SLATE)]
+    for cost, score, name, c in pts:
+        m = "*" if name == "Kimi K3" else "o"
+        s = 620 if name == "Kimi K3" else 170
+        ax.scatter([cost], [score], s=s, color=c, marker=m, zorder=5, edgecolor="white", lw=1.5)
+        ax.text(cost, score + (0.7 if name != "Kimi K3" else -1.6),
+                name + (f"\n${cost}/任务" if name == "Kimi K3" else ""),
+                ha="center", fontsize=10.5, color=c, weight="bold")
+    # frontier line
+    ax.plot([2.03, 4.1, 18, 22], [91.2, 90.4, 84.3, 88.0], color=LGREY, ls="--", zorder=1)
+    ax.set_xlabel("每任务成本（美元，越左越好）", fontsize=12)
+    ax.set_ylabel("BrowseComp 分数（越上越好）", fontsize=12)
+    ax.set_title("成本-质量前沿：架构效率兑现为价格优势", fontsize=13, weight="bold", color=INK)
+    ax.set_xlim(0, 26); ax.set_ylim(82, 94); ax.grid(alpha=0.2)
+    ax.annotate("左上角 = 又好又便宜", xy=(2.5, 91), xytext=(8, 92.6),
+                arrowprops=dict(arrowstyle="-|>", color=TEAL, lw=1.6), color=TEAL, fontsize=11, weight="bold")
+    save(fig, "f_cost.png")
+
+
+# =========================================================================
+# 31. Kernel optimization case
+# =========================================================================
+def f_kernel_case():
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(10, 4.4), dpi=200)
+    fig.patch.set_facecolor(BG)
+    a1.bar(["优化前", "K3 优化后"], [283.6, 114.4], color=[SLATE, TEAL], width=0.5)
+    a1.set_title("AttnRes kernel 延迟 (ms)", fontsize=11.5, weight="bold", color=INK)
+    for i, v in enumerate([283.6, 114.4]):
+        a1.text(i, v + 6, f"{v}", ha="center", fontsize=11, weight="bold")
+    a1.text(0.5, 250, "−60%", ha="center", color=GREEN, fontsize=14, weight="bold")
+    a1.grid(alpha=0.2, axis="y")
+    labels = ["AttnRes", "KDA", "DSA"]
+    red = [60, 73.6, 55.1]
+    a2.barh(labels[::-1], red[::-1], color=[TEAL, NAVY, VIOLET][::-1])
+    for i, v in enumerate(red[::-1]):
+        a2.text(v + 1, i, f"−{v}%", va="center", fontsize=10.5, weight="bold")
+    a2.set_xlim(0, 90); a2.set_title("K3 自主优化 kernel 的加速幅度", fontsize=11.5, weight="bold", color=INK)
+    a2.grid(alpha=0.2, axis="x")
+    fig.tight_layout()
+    save(fig, "f_kernel_case.png")
+
+
 if __name__ == "__main__":
     for fn in [f_threeaxis, f_hybrid, f_kda_state, f_kda_decay, f_attnres,
                f_blockattnres, f_latentmoe, f_situ, f_qb, f_compare, f_scaling,
                f_longctx, f_qat, f_parallel, f_schedule, f_1f1b, f_moonep_balance,
                f_moonep_proof, f_moonep_buffer, f_moonep_bench, f_mem_ledger,
-               f_act_manager, f_pp_rebalance, f_p2p_muon, f_bubble_fill, f_kcp]:
+               f_act_manager, f_pp_rebalance, f_p2p_muon, f_bubble_fill, f_kcp,
+               f_hybrid_tradeoff, f_flashkda, f_rl_experts, f_cost, f_kernel_case]:
         fn()
     print("ALL DONE")
