@@ -11,6 +11,7 @@
 | [`slides/kimi-k3-tech-share.html`](slides/kimi-k3-tech-share.html) | HTML 版（浏览器直接打开，支持演讲者模式） |
 | [`slides/kimi-k3-tech-share.md`](slides/kimi-k3-tech-share.md) | 幻灯片 Marp 源码（改内容后可重渲染） |
 | [`DESIGN_NOTES.md`](DESIGN_NOTES.md) | **思路梳理文档（落盘版）**——比 PPT 更全的动机 / 数学 / 演进 / 对比 / 备问 |
+| [`PRETRAIN_INFRA_DEEPDIVE.md`](PRETRAIN_INFRA_DEEPDIVE.md) | **预训练 Infra 深挖分析**——并行组合 / MoonEP（E/R 证明·零拷贝·静态形状）/ 显存组合拳 / 多模态 encoder，重原理与推导 |
 
 ## 内容主线
 
