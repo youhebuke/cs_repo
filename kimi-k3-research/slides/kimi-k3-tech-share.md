@@ -670,3 +670,145 @@ $$r=\mathrm{clip}\Big(\mathrm{sg}\log\tfrac{\pi_{teacher}}{\pi_{student}},-R_{ma
 ## 谢谢！
 
 <span class="small">备问：为何 3:1 而非全 KDA · NoPE 外推 · 896 选 16 如何训得动 · AttnRes 推理开销 · 与 DeepSeek 到底差在哪 —— 详见思路文档 DESIGN_NOTES.md</span>
+
+---
+
+<!-- _class: lead -->
+# 附录 · 预训练 Infra 深挖
+## （备用深讲页 · 详见 PRETRAIN_INFRA_DEEPDIVE.md）
+
+---
+
+## 附录 A1 · 并行组合的职责与耦合
+
+`PP(interleaved 1F1B + VPP) + EP + ZeRO-1 DP + Pipeline ZeRO-2 梯度分片 + CP(KCP)`
+
+| 维度 | 切什么 | 为什么不可或缺 |
+|---|---|---|
+| PP(+VPP) | 93 层按 stage | 层多单层大；VPP 压 pipeline bubble |
+| EP | 896 专家按 rank | 专家权重占大头，DP 复制会爆 |
+| ZeRO-1 DP | 优化器状态分片 | 扩批量、通信最省 |
+| Pipeline ZeRO-2 | 梯度分片(+CPU) | 在 PP 之上再压 GPU 峰值 |
+| CP(KCP) | 序列维 | 1M 上下文放不下；KDA 递归态专门处理 |
+
+- **关键约束**：EP 的 all-to-all、PP 的 P2P、DP 的 reduce **争抢同一带宽** → 全篇主线是 **用计算盖住每一条通信**
+- **显存是全局零和**：ZeRO-2 把梯度下沉 CPU，是为给激活 offload / RL 的外部 KV pool 腾 HBM
+
+---
+
+## 附录 A2 · 1F1B + VPP：bubble 与激活峰值
+
+- GPipe bubble 占比 ≈ $(p-1)/m$（$p$=stage 数，$m$=micro-batch 数）
+- **1F1B**：不改 bubble 比例，但稳态下每 stage 只驻留 ~$p$ 份在飞激活（而非全部 $m$ 份）→ **降激活峰值**
+- **VPP**：每物理 stage 再拆 $v$ 个虚拟块 → bubble ≈ $(p-1)/(m\cdot v)$，代价是**通信次数 ×v**
+- **副作用（后面要治）**：暖机期各 stage 驻留激活**不均** → 附录 A7 的「PP 激活再平衡」
+
+**Fig.11 调度三条意图**：
+1. shared expert 拆 SE1/SE2 派独立 stream → 填 all-to-all 空档
+2. `reduce grad` = reduce_scatter + onload + add + offload（= Pipeline ZeRO-2 + CPU 梯度）
+3. EP-DR（dispatch 重算）在反向 → memory-efficient MoE
+
+---
+
+## 附录 A3 · 常规 EP 的三连击（同源）
+
+设 $S$=每 rank token 数，$K$=top-k，$E$=专家数，$R$=EP size。
+
+1. **热 rank 决定迭代时间**：EP 是同步屏障，最慢 rank 拖住全部
+2. **动态形状 → 碎片 → OOM**：每步每层路由计数都变，routed 激活 shape 变化 → 分配器反复申请释放 → 碎片累积
+3. **每层 host↔device 同步**：grouped GEMM 需 `cu_seqlens`（设备上算的数据相关量）→ host 必须读回才能按形状发射 → 每层一次，CPU 卡在关键路径
+
+> 三点**同源**：都是"token→专家映射动态且不均"的后果。
+> **治本 = 让映射结果对系统而言变成静态且均衡。**
+
+---
+
+## 附录 A4 · MoonEP 机制：动态冗余专家
+
+**目标**：每 rank 恰收 $S\times K$ 个 token（计算量完全相同）
+**手段**：**冗余专家** —— 把热专家临时复制到别的 rank，长尾被摊平
+
+- **前向**：从当前 router 输出**在线规划**冗余专家 → **预取**权重到本地槽 → 形状一致的 grouped GEMM
+- **反向**：冗余专家梯度先 stage 到**本地 reduce buffer**，算完 `reduce` 回 **home rank**
+- 权重布局 `[E+B,H,H']`：`[0,E)` 本地专家、`[E,E+B)` 预取槽；训练 **$B=E/R$**
+- **在线规划**：离线 ILP 求精确最优做**标尺**，线上用**近最优 GPU planning kernel**（开销可忽略、恒满足 $E/R$）
+
+---
+
+## 附录 A5 · 为什么 buffer 是 S×K 而非 S×K×R + 静态形状
+
+<div class="cols">
+<div class="col">
+
+### Zero-copy 缓冲区
+- 规划 kernel **预算每 token 目的地** → token 直接写到远端最终槽位，buffer 视图直接给计算（**无 comm→user 拷贝**）
+- **DeepEP**：最坏某 rank 收下所有 $R$ 个 rank 的 $S{\times}K$ → 需 $S{\times}K{\times}R$
+- **MoonEP**：完美均衡恒收 $S{\times}K$ → **固定 $S{\times}K$**，与倾斜无关
+
+</div>
+<div class="col">
+
+### 静态形状红利
+- 形状静态已知 → **消除每层 MoE host 同步**、降 launch 开销
+- **rank 内仍偏斜** → workload-aware GEMM 调度（分析代价模型 + 离线 autotune）
+- shared 专家 GEMM 派独立 stream overlap
+
+</div>
+</div>
+
+> 均衡 → 静态形状 → 免同步 + 零拷贝 + 无碎片，全是**免费红利**。
+
+---
+
+## 附录 A6 · MoonEP 对比总表
+
+| 维度 | DeepEP | ECHO / UltraEP | **MoonEP** |
+|---|---|---|---|
+| 负载均衡 | 无（硬扛） | 固定冗余/cap，可能无解 | **完美均衡，规划恒可行** |
+| 零拷贝 buffer | 最坏 $S{\times}K{\times}R$ | — | **固定 $S{\times}K$** |
+| 计算形状 | 动态（每层 host 同步） | 动态 | **静态（免同步）** |
+| 高不均行为 | 通信恶化、碎片→OOM | **训练可能中断**+手调 | **迭代时间持平、不 OOM** |
+
+> 思想：**用很小代价（≤$E/R$ 冗余专家 + 规划 kernel）把"数据相关的不均"变成"系统层面的完全确定与均衡"。**
+
+---
+
+## 附录 A7 · 显存账本：各手段省在哪
+
+| 手段 | 省的是 | 代价 |
+|---|---|---|
+| FP8 块量化激活 | 激活字节 (~½) | 量化/反量化算力 |
+| offload / 远程 offload | HBM → CPU/远端 HBM | 互联带宽（被 overlap 盖住） |
+| 跨层重计算 | 激活保存 | 前向重算算力 |
+| Memory-efficient MoE | 前向 output + dispatch 输入 | 少量逐元素 + 可 overlap 重算 |
+| Block AttnRes checkpoint | $O(Ld)\to O(Nd)$ | AttnRes 重算 |
+| PP 激活再平衡 | **峰值** rank 的 HBM | 跨 rank 传输(Mooncake) |
+| Pipeline ZeRO-2 + CPU 梯度 | GPU 梯度显存 | CPU 内存 + offload |
+| P2P Muon | 全参 buffer + all-gather | P2P(流水隐藏) |
+
+> **统一激活管理器**：把这些都做成 tensor 粒度、注解声明、可自由组合的"存储策略"；单内存池防多流碎片。
+
+---
+
+## 附录 A8 · P2P Muon：定向通信 > 广播
+
+- **约束**：Newton–Schulz 迭代 $X\leftarrow aX+b\,X(X^{\top}X)+\dots$ 是**整矩阵多项式**，必须完整参数矩阵 → 无法在分片上独立做；但优化器已按 DP 分片参数
+- **朴素**：全量 all-gather 完整参数 → **显存**（每 rank 多一份全参 buffer）+ **通信**（all-gather 全参）双爆炸
+- **K3**：每 rank 只 **P2P 拉回"自己负责更新的参数"的分片**（属主→更新者定向）→ 重建自己要更新的矩阵即可
+  - 临时 buffer 从 $O(P)$ 降到 $O(P/\mathrm{DP})$，**消除全参 buffer**
+  - 按 model-chunk buffer 粒度把通信与计算**流水隐藏**
+
+> 原理：**只有"要更新某参数的 rank"才需要它的完整矩阵** → gather 应定向，而非广播。
+
+---
+
+## 附录 A9 · 组件耦合：谁解决谁 / 谁增强谁
+
+- **痛点① EP 不均 → MoonEP**：附带静态形状（免同步）、零拷贝（通信不膨胀）、无碎片（**反哺显存**）
+- **痛点② 显存 → 组合拳**：统一激活管理 + memory-efficient MoE + Block AttnRes checkpoint + PP 激活再平衡 + Pipeline ZeRO-2 + P2P Muon → 腾出的 HBM 支撑更长序列 / RL 外部 KV pool
+- **痛点③ ViT 方差 → Dynamic CP + Bubble filling**（承 K2.5 DEP，思路同 Optimus）
+- **贯穿**：每条通信（all-to-all / P2P / reduce / offload）都被某段计算盖住
+
+**两个"协同放大"**：
+1. **MoonEP 静态形状 × 单内存池** → 动态形状是碎片之源，消灭它后几乎不再碎片化：**均衡直接改善显存**
+2. **KDA 下界化衰减（算法）× FlashKDA（系统）** → 加下界让对角块上 Tensor Core，FlashKDA 才能充分 overlap：**算法改动是系统优化的前提**
