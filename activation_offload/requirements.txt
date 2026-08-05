@@ -1,0 +1,4 @@
+# Core dependency. On a CPU box install the CPU wheel:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# On a CUDA box install the matching CUDA wheel from https://pytorch.org.
+torch>=2.1
