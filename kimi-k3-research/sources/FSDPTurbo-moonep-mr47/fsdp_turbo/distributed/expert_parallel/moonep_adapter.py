@@ -19,6 +19,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
 from fsdp_turbo.ops.grad_weight_sink import GradWeightSink
+from fsdp_turbo.ops.weight_views import release_weight_views
 
 if TYPE_CHECKING:
     from torch.distributed import DeviceMesh
@@ -401,6 +402,9 @@ class MoonEPSymmetricProjection:
             return
         self.closed = True
         self._grad_sink = None
+        # Cached per-group views hold the mapping through ``_base``, so they
+        # must go before the mapping itself can be unmapped.
+        release_weight_views(self.full_weight)
         self.full_weight = None
         self.expert_allocation = None
 
