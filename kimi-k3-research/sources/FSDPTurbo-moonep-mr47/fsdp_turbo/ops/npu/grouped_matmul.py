@@ -1,6 +1,7 @@
 import torch
 from fsdp_turbo.ops.grad_weight_sink import validate_sink
 from fsdp_turbo.ops.registry import register_op
+from fsdp_turbo.ops.weight_views import grouped_weight_views
 
 try:
     import torch_npu
@@ -61,14 +62,11 @@ class GroupedMatmul(torch.autograd.Function):
         ctx.group_list_type = group_list_type
         ctx.sink = sink
 
-        # Get weight chunks
-        weight_chunks = [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
-
         # Weights follow the linear-layer convention [output_dim, input_dim] per expert.
         # Transpose to [input_dim, output_dim] so that input [M, K] @ weight.T [K, N] = output [M, N].
         # Always transpose rather than guessing from shape, since shape-based detection is
         # unreliable when input_dim == output_dim (square weight matrices).
-        weights_for_matmul = [w.T for w in weight_chunks]
+        _, weights_for_matmul = grouped_weight_views(weights)
 
         ctx.save_for_backward(input_tensor, weights)
 
@@ -84,8 +82,7 @@ class GroupedMatmul(torch.autograd.Function):
         group_list_type = ctx.group_list_type
         sink = ctx.sink
 
-        # Get weight chunks (original [output_dim, input_dim] format)
-        weight_chunks = [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
+        weight_chunks, _ = grouped_weight_views(weights)
 
         # Calculate input gradient: grad_output [M, N] @ weight [N, K] = grad_input [M, K].
         # Forward used transposed weights, so the original weights are used directly here.
