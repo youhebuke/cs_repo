@@ -11,6 +11,8 @@
 | [`slides/kimi-k3-tech-share.html`](slides/kimi-k3-tech-share.html) | HTML 版（浏览器直接打开，支持演讲者模式） |
 | [`slides/kimi-k3-tech-share.md`](slides/kimi-k3-tech-share.md) | 幻灯片 Marp 源码（改内容后可重渲染） |
 | [`DESIGN_NOTES.md`](DESIGN_NOTES.md) | **思路梳理文档（落盘版）**——比 PPT 更全的动机 / 数学 / 演进 / 对比 / 备问 |
+| [`MOONEP_FSDPTURBO_ANALYSIS.md`](MOONEP_FSDPTURBO_ANALYSIS.md) | **MoonEP × FSDPTurbo MR#47 代码对照分析** |
+| [`sources/`](sources/) | MoonEP 与 FSDPTurbo MR#47 源码镜像 |
 
 ## 内容主线
 
