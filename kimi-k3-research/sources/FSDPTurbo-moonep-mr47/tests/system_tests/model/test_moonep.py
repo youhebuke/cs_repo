@@ -34,6 +34,7 @@ from fsdp_turbo.fsdp_turbo_config import (
 from fsdp_turbo.utils.device import set_accelerator_compatible
 from fsdp_turbo.utils.log import print_rank, set_log_level
 from fsdp_turbo.utils.random import set_seed
+from fsdp_turbo.training.clip_grads import clip_grad_norm, compute_grad_norm
 
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,10 @@ MOONEP_ASYNC_FINISH = os.environ.get("MOONEP_ASYNC_FINISH", "1").lower() in (
     "yes",
     "on",
 )
+
+# Gradient monitoring. Set CLIP_GRAD>0 to clip; otherwise only log the norm.
+CLIP_GRAD = float(os.environ.get("CLIP_GRAD", "0"))
+GRAD_NORM_TYPE = float(os.environ.get("GRAD_NORM_TYPE", "2.0"))
 
 
 def initialize_distributed() -> tuple[int, int, int]:
@@ -361,6 +366,17 @@ def train(
                     f"Non-finite loss at step {step}: {loss.item()}"
                 )
             loss.backward()
+            if CLIP_GRAD > 0:
+                grad_norm = clip_grad_norm(
+                    model.model,
+                    max_norm=CLIP_GRAD,
+                    norm_type=GRAD_NORM_TYPE,
+                )
+            else:
+                grad_norm = compute_grad_norm(
+                    model.model.parameters(),
+                    norm_type=GRAD_NORM_TYPE,
+                )
             optimizer.step()
 
             torch.accelerator.synchronize(device)
@@ -374,7 +390,7 @@ def train(
             if rank == 0:
                 print_rank(
                     logger.info,
-                    f"step={step} loss={loss.item():.6f} "
+                    f"step={step} loss={loss.item():.6f} grad_norm={grad_norm:.6f} "
                     f"time={elapsed:.4f}s "
                     f"memory={torch.accelerator.memory.memory_allocated(device) / 2**30:.2f}GiB "
                     f"peak_memory={torch.accelerator.memory.max_memory_allocated(device) / 2**30:.2f}GiB",
