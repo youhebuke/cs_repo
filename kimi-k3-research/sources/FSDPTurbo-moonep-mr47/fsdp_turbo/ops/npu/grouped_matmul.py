@@ -1,4 +1,5 @@
 import torch
+from fsdp_turbo.ops.grad_weight_sink import validate_sink
 from fsdp_turbo.ops.registry import register_op
 
 try:
@@ -7,9 +8,50 @@ except ImportError:
     torch_npu = None
 
 
+# Whether ``npu_grouped_matmul`` accepts ``output_dtype`` for BF16/FP16 inputs.
+# Probed once on the first weight-gradient call and cached, because the answer
+# depends on the installed CANN and torch_npu versions.
+_SUPPORTS_OUTPUT_DTYPE = None
+
+
+
+def _weight_grad(inputs, grad_output, group_list, group_list_type, output_dtype):
+    """Compute the per-group weight gradient as a ``[groups, in, out]`` tensor.
+
+    ``output_dtype`` requests the accumulation dtype directly from the kernel so
+    that an FP32 gradient buffer does not need a separate cast afterwards.
+    """
+    global _SUPPORTS_OUTPUT_DTYPE
+
+    def launch(**extra):
+        return torch_npu.npu_grouped_matmul(
+            [inputs.T],
+            [grad_output],
+            bias=None,
+            group_list=group_list,
+            split_item=3,
+            group_type=2,
+            group_list_type=group_list_type,
+            **extra,
+        )[0]
+
+    if output_dtype is None or output_dtype == grad_output.dtype:
+        return launch()
+    if _SUPPORTS_OUTPUT_DTYPE is False:
+        return launch()
+    try:
+        result = launch(output_dtype=output_dtype)
+    except (RuntimeError, TypeError):
+        _SUPPORTS_OUTPUT_DTYPE = False
+        return launch()
+    _SUPPORTS_OUTPUT_DTYPE = True
+    return result
+
+
 class GroupedMatmul(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_tensor: torch.Tensor, weights, weights_bias, m_split, group_list_type) -> torch.Tensor:
+    def forward(ctx, input_tensor: torch.Tensor, weights, weights_bias, m_split, group_list_type,
+                sink=None) -> torch.Tensor:
         # Due to ascend gmm kernel k split limitations, we need a tensor m_split, not a tensor List.
         if not isinstance(m_split, torch.Tensor):
             ctx.group_list = torch.tensor(m_split, device='npu', dtype=torch.int64)
@@ -17,6 +59,7 @@ class GroupedMatmul(torch.autograd.Function):
             ctx.group_list = m_split
 
         ctx.group_list_type = group_list_type
+        ctx.sink = sink
 
         # Get weight chunks
         weight_chunks = [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
@@ -39,6 +82,7 @@ class GroupedMatmul(torch.autograd.Function):
         group_list = ctx.group_list
         inp, weights = ctx.saved_tensors
         group_list_type = ctx.group_list_type
+        sink = ctx.sink
 
         # Get weight chunks (original [output_dim, input_dim] format)
         weight_chunks = [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
@@ -49,17 +93,29 @@ class GroupedMatmul(torch.autograd.Function):
                                             group_list=group_list, split_item=2, group_type=0,
                                             group_list_type=group_list_type)[0]
 
-        # Calculate weight gradient (K split gmm): grad_weight = inp^T @ grad_output = [K, N]
-        grad_weight = torch_npu.npu_grouped_matmul([inp.T], [grad_output], bias=None,
-                                                   group_list=group_list, split_item=3,
-                                                   group_type=2, group_list_type=group_list_type)[0]
+        # Calculate weight gradient (K split gmm): grad_weight = inp^T @ grad_output = [K, N].
+        # ``transpose`` restores the [output_dim, input_dim] convention as a view; stacking
+        # transposed chunks instead would copy the whole gradient a second time.
+        grad_weight = _weight_grad(
+            inp,
+            grad_output,
+            group_list,
+            group_list_type,
+            sink.buffer.dtype if sink is not None else None,
+        ).transpose(1, 2)
 
-        # Transpose to match original weight format [output_dim, input_dim]
-        grad_weight_chunks = [w.T for w in grad_weight]
+        if sink is None:
+            return grad, grad_weight, None, None, None, None
 
-        return grad, torch.stack(grad_weight_chunks), None, None, None
+        # Only this rank's own rows are copied into the symmetric buffer; the
+        # remaining rows are remote ranks' gradients that must stay untouched.
+        for start, end in sink.row_ranges:
+            sink.buffer[start:end].copy_(grad_weight[start:end])
+        return grad, None, None, None, None, None
 
 
 @register_op('grouped_matmul', 'npu')
-def grouped_matmul_npu(inputs, m_split, weights):
-    return GroupedMatmul.apply(inputs, weights, None, m_split, 1)
+def grouped_matmul_npu(inputs, m_split, weights, grad_weight_sink=None):
+    if grad_weight_sink is not None:
+        validate_sink(grad_weight_sink, weights)
+    return GroupedMatmul.apply(inputs, weights, None, m_split, 1, grad_weight_sink)
