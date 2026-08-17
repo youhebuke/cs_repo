@@ -18,6 +18,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
+from fsdp_turbo.ops.grad_weight_sink import GradWeightSink
+
 if TYPE_CHECKING:
     from torch.distributed import DeviceMesh
 
@@ -152,12 +154,12 @@ class _ProjectionPool:
     The gradient side follows MoonEP's documented layout: one contiguous
     ``[E+B, out, in]`` FP32 mapping whose rows ``[0, E)`` are every rank's
     parameter gradients and whose rows ``[E, E+B)`` alias this rank's slice of
-    the reduce buffer. Previously those two regions were separate allocations,
-    so the ``[E+B]`` view the weights already had did not exist on the gradient
-    side and every backward had to materialize one.
+    the reduce buffer. Handing that mapping to the grouped matmul lets the
+    backward pass accumulate in place instead of allocating a second full-size
+    gradient tensor and copying it in afterwards.
 
     One pool is shared by every layer with the same projection shape, so the
-    memory is a fixed cost per shape rather than per layer.
+    extra memory is a fixed cost per shape rather than per layer.
     """
 
     def __init__(self, runtime: "MoonEPRuntime", role: str, shape: tuple[int, int]):
@@ -282,6 +284,7 @@ class MoonEPSymmetricProjection:
         self.runtime = runtime
         self.role = role
         self.closed = False
+        self._grad_sink: GradWeightSink | None = None
         self.global_shape = tuple(source.shape)
         self.out_features = int(source.shape[-2])
         self.in_features = int(source.shape[-1])
@@ -340,23 +343,37 @@ class MoonEPSymmetricProjection:
             num_sms=self.runtime.config.num_sms,
         )
 
-    def reduce_gradient(self, full_grad: torch.Tensor, plan, comm_context: dict) -> torch.Tensor:
-        num_experts = self.runtime.num_experts
+    def grad_weight_sink(self) -> GradWeightSink:
+        """Expose the ``[E+B]`` FP32 buffer the grouped matmul writes into.
+
+        Only the rows this rank physically owns are writable: its own experts
+        and the local prefetch slots. Every other row reaches a remote rank
+        through the symmetric mapping. The sink is cached so that any staging
+        buffer it allocates is reused for the lifetime of the projection.
+        """
+        if self._grad_sink is None:
+            num_experts = self.runtime.num_experts
+            experts_per_rank = self.runtime.experts_per_rank
+            start = self.runtime.rank * experts_per_rank
+            self._grad_sink = GradWeightSink(
+                buffer=self.pool.main_grad,
+                row_ranges=(
+                    (start, start + experts_per_rank),
+                    (num_experts, num_experts + experts_per_rank),
+                ),
+            )
+        return self._grad_sink
+
+    def reduce_gradient(self, plan, comm_context: dict, dtype: torch.dtype) -> torch.Tensor:
         rank = self.runtime.rank
         experts_per_rank = self.runtime.experts_per_rank
         start = rank * experts_per_rank
         end = start + experts_per_rank
 
-        # Keep only the locally owned base gradients and the local prefetch-slot
-        # gradients in FP32. Both writes land in the pool's ``[E+B, ...]``
-        # mapping: ``owner_grad_full`` is its first E rows and
-        # ``reduce_buffers[rank]`` is the trailing B, so the reduction kernel
-        # keeps its global indexing contract.
-        self.pool.owner_grad_buffers[rank].copy_(full_grad[start:end])
-        self.pool.reduce_buffers[rank].copy_(
-            full_grad[num_experts:num_experts + experts_per_rank]
-        )
-
+        # The grouped matmul already wrote this step's FP32 gradients into the
+        # [E+B] mapping: rows [0, E) are the owner ranks' gradients and rows
+        # [E, E+B) alias this rank's reduce slots.
+        #
         # ``launch_grad_reduce`` reads every rank's reduce slots before its
         # internal cross-rank barrier. Publish the local slot writes and wait
         # until every peer has done the same before any rank starts reading.
@@ -375,34 +392,36 @@ class MoonEPSymmetricProjection:
             grid_sync_bar=comm_context["grid_sync_bar"],
         )
         # The pool is reused by other layers with the same projection shape.
-        # Casting back to the BF16 parameter dtype also gives autograd an
+        # Casting back to the parameter dtype also gives autograd an
         # independent, local-sized result before the pool is overwritten.
-        return self.pool.owner_grad_buffers[rank].to(dtype=full_grad.dtype)
+        return self.pool.main_grad[start:end].to(dtype=dtype)
 
     def close(self) -> None:
         if self.closed:
             return
         self.closed = True
+        self._grad_sink = None
         self.full_weight = None
         self.expert_allocation = None
 
 
-class _MoonEPWeightsBridge(torch.autograd.Function):
-    """Connect both registered parameters to their full VMM mappings.
+class _MoonEPWeightGradBridge(torch.autograd.Function):
+    """Reduce both projections' weight gradients and hand them to autograd.
 
-    A single multi-output autograd node receives both projection gradients and
-    therefore launches the cross-rank reductions in the same order on every
-    rank. Independent bridge nodes could be scheduled in different orders and
-    deadlock MoonEP's internal barriers.
+    The node is applied to the dispatched activations, i.e. upstream of both
+    grouped matmuls, so in the backward pass it runs only once every expert
+    gradient has been written into the ``[E+B]`` buffers. A single multi-output
+    node also launches the cross-rank reductions in the same order on every
+    rank; independent nodes could be scheduled differently and deadlock
+    MoonEP's internal barriers.
     """
 
     @staticmethod
     def forward(
         ctx,
+        dispatched,
         local_gate_up,
         local_down,
-        full_gate_up,
-        full_down,
         gate_up_projection,
         down_projection,
         plan,
@@ -414,30 +433,22 @@ class _MoonEPWeightsBridge(torch.autograd.Function):
         ctx.comm_context = comm_context
         ctx.gate_up_dtype = local_gate_up.dtype
         ctx.down_dtype = local_down.dtype
-        return (
-            full_gate_up.as_strided(full_gate_up.shape, full_gate_up.stride()),
-            full_down.as_strided(full_down.shape, full_down.stride()),
-        )
+        return dispatched.as_strided(dispatched.shape, dispatched.stride())
 
     @staticmethod
-    def backward(ctx, grad_full_gate_up, grad_full_down):
-        if grad_full_gate_up is None or grad_full_down is None:
-            raise RuntimeError(
-                "MoonEP requires gradients for both gate_up_proj and down_proj."
-            )
+    def backward(ctx, grad_dispatched):
         # Fixed ordering is part of the distributed protocol.
         with torch.profiler.record_function("moonep.grad_reduce"):
             local_down = ctx.down_projection.reduce_gradient(
-                grad_full_down, ctx.plan, ctx.comm_context
+                ctx.plan, ctx.comm_context, ctx.down_dtype
             )
             local_gate_up = ctx.gate_up_projection.reduce_gradient(
-                grad_full_gate_up, ctx.plan, ctx.comm_context
+                ctx.plan, ctx.comm_context, ctx.gate_up_dtype
             )
         return (
-            local_gate_up.to(ctx.gate_up_dtype),
-            local_down.to(ctx.down_dtype),
-            None,
-            None,
+            grad_dispatched,
+            local_gate_up,
+            local_down,
             None,
             None,
             None,
@@ -733,14 +744,20 @@ def moonep_weighted_combine(
     )
 
 
-def moonep_weights_for_step(
+def moonep_bind_weight_grads(
+    dispatched: torch.Tensor,
     gate_up_parameter: torch.Tensor,
     down_parameter: torch.Tensor,
     gate_up_projection: MoonEPSymmetricProjection,
     down_projection: MoonEPSymmetricProjection,
     plan,
     comm_context: dict,
-):
+) -> torch.Tensor:
+    """Route both projections' weight gradients back to their parameters.
+
+    Returns ``dispatched`` unchanged; the returned tensor must be the one fed
+    to the expert grouped matmuls so that the reduction runs after them.
+    """
     local_gate_up = (
         gate_up_parameter.to_local()
         if isinstance(gate_up_parameter, DTensor)
@@ -751,11 +768,10 @@ def moonep_weights_for_step(
         if isinstance(down_parameter, DTensor)
         else down_parameter
     )
-    return _MoonEPWeightsBridge.apply(
+    return _MoonEPWeightGradBridge.apply(
+        dispatched,
         local_gate_up,
         local_down,
-        gate_up_projection.full_weight,
-        down_projection.full_weight,
         gate_up_projection,
         down_projection,
         plan,

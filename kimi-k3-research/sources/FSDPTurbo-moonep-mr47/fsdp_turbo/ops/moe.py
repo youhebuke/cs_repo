@@ -1,24 +1,44 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import torch
 from fsdp_turbo.ops import dispatch_op
+from fsdp_turbo.ops.grad_weight_sink import GradWeightSink
+
+__all__ = [
+    'GradWeightSink',
+    'grouped_matmul',
+    'all2all_grouped_matmul',
+    'grouped_matmul_all2all',
+    'permute',
+    'unpermute',
+]
 
 
-def grouped_matmul(inputs, m_split, weights, use_eager=False):
+def grouped_matmul(inputs, m_split, weights, use_eager=False, grad_weight_sink=None):
     """
     Grouped matrix multiplication with automatic device dispatch.
-    
+
     Args:
         inputs: Input tensor
         m_split: Group sizes
         weights: Weight tensor
         use_eager: If False, use fused (optimized) implementation for current device.
                    If True, use CPU implementation.
-    
+        grad_weight_sink: Optional :class:`GradWeightSink`. When given, the
+            backward pass writes the weight gradient into the sink's buffer and
+            returns no autograd gradient for ``weights``.
+
     Returns:
         Result of grouped matrix multiplication
     """
     device_type = 'cpu' if use_eager else None  # Use CPU implementation if not fused
-    return dispatch_op('grouped_matmul', inputs, m_split, weights, device_type=device_type)
+    return dispatch_op(
+        'grouped_matmul',
+        inputs,
+        m_split,
+        weights,
+        grad_weight_sink=grad_weight_sink,
+        device_type=device_type,
+    )
 
 
 def all2all_grouped_matmul(inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None, use_eager=False):
