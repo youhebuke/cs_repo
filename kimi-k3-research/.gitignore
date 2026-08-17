@@ -1,5 +1,8 @@
-# Third-party sources (cloned repos + report PDF), not redistributed here
-sources/
+# Third-party sources not mirrored in-repo (e.g. report PDF)
+sources/*
+!sources/README.md
+!sources/MoonEP/
+!sources/FSDPTurbo-moonep-mr47/
 
 # Node deps for slide build (reinstall with `npm install` in slides/)
 slides/node_modules/

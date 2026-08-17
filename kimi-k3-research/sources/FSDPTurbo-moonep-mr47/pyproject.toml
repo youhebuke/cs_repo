@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fsdp-turbo"
+version = "0.1.0"
+description = "A high-performance and easy-to-use distributed training acceleration library"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [
+    {name = "Huawei Technologies Co., Ltd."},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.4.0",
+    "pyyaml>=6.0",
+    "transformers>=5.0.0",
+    "datasets>=2.14.0",
+]
+
+[project.optional-dependencies]
+npu = ["torch_npu"]
+moonep = ["torch>=2.9.0,<2.12.0", "moonep==0.0.1"]
+gpu = ["transformer-engine"]
+
+[project.urls]
+Homepage = "https://gitcode.com/Ascend/FSDPTurbo"
+
+[tool.setuptools.packages.find]
+include = ["fsdp_turbo", "fsdp_turbo.*"]
