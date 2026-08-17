@@ -83,8 +83,11 @@ class GradWeightSink:
   （这条对未使用 sink 的旧路径同样生效）
 - 只把 `row_ranges` 覆盖的 `2×(E/R)` 行写进 buffer，而不是整个 `E+B` 行
 
-**CUDA / CPU**：逐 group `torch.mm(..., out=buffer[g])`；dtype 不一致时复用一块
-`[out, in]` staging，而不是分配整个 `[E+B, out, in]`。
+**CUDA**（`fsdp_turbo/ops/cuda/grouped_matmul.py`）：见下节「GPU 适配」。
+
+**CPU**：逐 group `torch.mm(..., out=buffer[g])`；dtype 不一致时复用一块
+`[out, in]` staging，而不是分配整个 `[E+B, out, in]`。这条路径同时作为
+`write_group_grads` 的参考实现，被单元测试用来校验数值。
 
 ### 2.3 一个必须处理的正确性风险
 
@@ -116,7 +119,50 @@ backward:  combine → GMM(down)↓写 buffer → act → GMM(gate_up)↓写 buf
 
 ---
 
-## 3. 收益
+## 3. GPU 适配
+
+GPU 与 NPU 的差别只在算子层，`[E+B]` VMM 映射、sink 契约、bridge 位置全部复用。
+
+关键约束是 **`torch.mm` 不允许 out 张量 dtype 与输入不同**：
+
+```
+RuntimeError: Expected out tensor to have dtype c10::BFloat16, but got float instead
+```
+
+所以 BF16 激活直接写 FP32 buffer 在 `torch.mm` 上做不到。而
+`torch.nn.functional.grouped_mm` 提供了 `out_dtype`：
+
+```python
+F.grouped_mm(mat_a, mat_b, *, offs=None, bias=None, out_dtype=None)
+```
+
+于是 CUDA 侧走 **按本地 row range 的 K-grouped 融合 GEMM**：
+
+```python
+for row_start, row_end in sink.row_ranges:          # 本 rank 专家 + prefetch 槽，共 2 段
+    t0, t1 = token_span((row_start, row_end), group_ends)
+    partial = F.grouped_mm(
+        grad_output[t0:t1].transpose(0, 1),          # [out, tokens]
+        inputs[t0:t1],                               # [tokens, in]
+        offs=local_offsets,
+        out_dtype=sink.buffer.dtype,                 # 直出 FP32，无需 staging/cast
+    )
+    sink.buffer[row_start:row_end].copy_(partial)
+```
+
+- 只对本地的 `2×(E/R)` 行发起计算，临时张量从 `[E+B, out, in]` 降到 `[E/R, out, in]`
+- 两次融合 GEMM 取代 `2×(E/R)` 次 `torch.mm`，同时省掉逐 group 的 BF16→FP32 cast
+- token 边界来自 `offs.cpu()`——CUDA 反向本来就要做这次同步，不引入新的 device→host 同步
+
+`grouped_mm` 的 K-grouped 布局对算力架构与操作数对齐有要求，因此和 NPU 的
+`output_dtype` 一样采用**首次调用探测 + 缓存**：一旦抛
+`NotImplementedError / RuntimeError / TypeError`，永久回退到逐 group
+`torch.mm(..., out=buffer[g])` 路径（该路径完全不分配全尺寸张量，只复用一块
+`[out, in]` staging）。回退会重写全部本地行，因此融合路径写到一半失败也不会留下脏数据。
+
+越界检查 `assert_local_groups` 在任何 GEMM 之前执行，保证配置错误时 buffer 保持干净。
+
+## 4. 收益
 
 设 `R` = EP size，`B = E/R`，单个 projection 权重梯度尺寸 `W = (E+B)·out·in`。
 
@@ -131,12 +177,14 @@ backward:  combine → GMM(down)↓写 buffer → act → GMM(gate_up)↓写 buf
 NPU 侧的说明：`torch_npu.npu_grouped_matmul` 目前没有 `out=` 语义，算子仍会分配自己的
 输出。真正做到「零返回值」需要算子层支持写入指定 buffer，或按 host 侧 group 边界
 只对本地 group 发起计算——后者会引入 device→host 同步，与 MoonEP 免同步的设计相冲突，
-因此这一版保留算子输出，只消除框架侧的 stack / 拷贝。CUDA 侧因为是逐 group `torch.mm`，
-可以做到完全不分配全尺寸张量。
+因此这一版保留算子输出，只消除框架侧的 stack / 拷贝。
+
+CUDA 侧因为反向本来就要 `offs.cpu()`，可以直接按本地 row range 切片，临时张量降到
+`[E/R, out, in]`；回退路径逐 group `torch.mm(out=...)` 则完全不分配全尺寸张量。
 
 ---
 
-## 4. 验证
+## 5. 验证
 
 ```bash
 cd sources/FSDPTurbo-moonep-mr47
@@ -150,6 +198,7 @@ PYTHONPATH=. python3 -m pytest tests/unit -q
 | `tests/unit/test_moonep_grad_weight_sink.py` | sink 结果与 autograd 参考一致；FP32 目标 + BF16 计算；越界行报错；空 group 不被清零；shape 校验 |
 | `tests/unit/test_moonep_weight_grad_bridge.py` | reduce 在两个 GMM 反向之后触发；固定 `down → gate_up` 顺序；参数梯度与纯 autograd 参考逐元素相等 |
 | `tests/unit/test_moonep_gradient_reduce.py` | `reduce_gradient` 不再拷贝、返回独立局部张量 |
+| `tests/unit/test_moonep_cuda_weight_grad.py` | CUDA 融合路径与逐 group 参考数值一致；探测失败后回退且只探测一次；BF16 输入直出 FP32 不用 staging；越界在 GEMM 前就报错；有 CUDA 时跑真实设备用例 |
 
 上机验证（需 NPU/GPU 实机）：
 

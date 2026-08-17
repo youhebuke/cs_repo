@@ -60,6 +60,26 @@ def validate_sink(sink: GradWeightSink, weights: torch.Tensor) -> None:
         raise RuntimeError("Grad weight sink must own at least one row range.")
 
 
+def assert_local_groups(sink: GradWeightSink, group_ends: Sequence[int]) -> None:
+    """Fail if a non-empty group would write a row owned by a remote rank."""
+    group_start = 0
+    for group_index, group_end in enumerate(group_ends):
+        if group_end != group_start and not sink.owns(group_index):
+            raise RuntimeError(
+                f"Grouped matmul group {group_index} received "
+                f"{group_end - group_start} tokens but its weight gradient row "
+                "is owned by a remote rank; MoonEP planning should only route "
+                "tokens to local or prefetched experts."
+            )
+        group_start = group_end
+
+
+def token_span(row_range: Tuple[int, int], group_ends: Sequence[int]) -> Tuple[int, int]:
+    """Return the token range covered by a half-open range of groups."""
+    row_start, row_end = row_range
+    return (group_ends[row_start - 1] if row_start else 0), group_ends[row_end - 1]
+
+
 def write_group_grads(
     sink: GradWeightSink,
     grad_output: torch.Tensor,
@@ -72,17 +92,11 @@ def write_group_grads(
     remote rank, and MoonEP's planner guarantees this rank only receives tokens
     for the experts it owns or prefetched.
     """
+    assert_local_groups(sink, group_ends)
     group_start = 0
     for group_index, group_end in enumerate(group_ends):
         if group_end == group_start:
             continue
-        if not sink.owns(group_index):
-            raise RuntimeError(
-                f"Grouped matmul group {group_index} received "
-                f"{group_end - group_start} tokens but its weight gradient row "
-                "is owned by a remote rank; MoonEP planning should only route "
-                "tokens to local or prefetched experts."
-            )
         destination = sink.buffer[group_index]
         left = grad_output[group_start:group_end].transpose(0, 1)
         right = inputs[group_start:group_end]
