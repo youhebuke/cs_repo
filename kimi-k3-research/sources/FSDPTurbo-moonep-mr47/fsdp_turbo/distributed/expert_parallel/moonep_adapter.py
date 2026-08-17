@@ -147,7 +147,18 @@ def _validate_projection_shape(
 
 
 class _ProjectionPool:
-    """Process-local prefetch slots and rank-mapped FP32 gradient slots."""
+    """Process-local prefetch slots and the rank-mapped FP32 gradient buffer.
+
+    The gradient side follows MoonEP's documented layout: one contiguous
+    ``[E+B, out, in]`` FP32 mapping whose rows ``[0, E)`` are every rank's
+    parameter gradients and whose rows ``[E, E+B)`` alias this rank's slice of
+    the reduce buffer. Previously those two regions were separate allocations,
+    so the ``[E+B]`` view the weights already had did not exist on the gradient
+    side and every backward had to materialize one.
+
+    One pool is shared by every layer with the same projection shape, so the
+    memory is a fixed cost per shape rather than per layer.
+    """
 
     def __init__(self, runtime: "MoonEPRuntime", role: str, shape: tuple[int, int]):
         self.runtime = runtime
@@ -156,37 +167,82 @@ class _ProjectionPool:
         self.closed = False
         experts_per_rank = runtime.experts_per_rank
         out_features, in_features = shape
+        chunk_shape = [experts_per_rank, out_features, in_features]
+        imports = runtime.imports
+        ranks = list(range(runtime.size))
 
-        allocation, export_handle, owned_handle = runtime.imports.nvl_dist_alloc(
-            shape=[experts_per_rank, out_features, in_features], dtype=torch.bfloat16
+        allocation, export_handle, owned_handle = imports.nvl_dist_alloc(
+            shape=chunk_shape, dtype=torch.bfloat16
         )
-        runtime.imports.nvl_release_mem_handle(owned_handle)
+        imports.nvl_release_mem_handle(owned_handle)
         self.prefetch_allocation = allocation
         self.prefetch_export_handle = export_handle
 
-        self.reduce_full = runtime.imports.create_nvl_dist_tensor(
-            [experts_per_rank, out_features, in_features],
-            torch.float32,
-            runtime.rank,
-            runtime.size,
-            group=runtime.group,
+        # Reduce slots hold duplicated experts' gradients. They are allocated
+        # explicitly rather than through ``create_nvl_dist_tensor`` so the local
+        # chunk's handle can also back rows [E, E+B) of the main-grad mapping.
+        reduce_allocation, reduce_handle, reduce_owned = imports.nvl_dist_alloc(
+            shape=chunk_shape, dtype=torch.float32
+        )
+        imports.nvl_release_mem_handle(reduce_owned)
+        self.reduce_allocation = reduce_allocation
+        self.reduce_export_handle = reduce_handle
+        self.reduce_full = self._map_across_ranks(
+            chunk_shape, torch.float32, os.dup(reduce_handle), ranks
         )
         self.reduce_buffers = self.reduce_full.view(
             runtime.size, experts_per_rank, out_features, in_features
         )
-        self.owner_grad_full = runtime.imports.create_nvl_dist_tensor(
-            [experts_per_rank, out_features, in_features],
-            torch.float32,
-            runtime.rank,
-            runtime.size,
-            group=runtime.group,
+
+        owner_allocation, owner_handle, owner_owned = imports.nvl_dist_alloc(
+            shape=chunk_shape, dtype=torch.float32
         )
+        imports.nvl_release_mem_handle(owner_owned)
+        self.owner_grad_allocation = owner_allocation
+        self.main_grad = self._map_across_ranks(
+            chunk_shape,
+            torch.float32,
+            owner_handle,
+            ranks,
+            extra_handle=os.dup(reduce_handle),
+        )
+        self.owner_grad_full = self.main_grad[: runtime.num_experts]
         self.owner_grad_buffers = self.owner_grad_full.view(
             runtime.size, experts_per_rank, out_features, in_features
         )
-        self.reduce_buffers[runtime.rank].zero_()
         self.owner_grad_buffers[runtime.rank].zero_()
+        self.main_grad[runtime.num_experts:].zero_()
         dist.barrier(group=runtime.group)
+
+    def _map_across_ranks(
+        self,
+        chunk_shape: list[int],
+        dtype: torch.dtype,
+        local_handle: int,
+        ranks: list[int],
+        extra_handle: int | None = None,
+    ) -> torch.Tensor:
+        """Map every rank's chunk, plus an optional local one, as one tensor."""
+        runtime = self.runtime
+        imports = runtime.imports
+        exchanged = imports.exchange_ipc_fds(
+            local_handle, ranks, runtime.rank, runtime.size, runtime.group
+        )
+        os.close(local_handle)
+        handles = [exchanged[rank] for rank in ranks]
+        if extra_handle is not None:
+            handles.append(extra_handle)
+        try:
+            return imports.nvl_dist_map(
+                chunk_shape=chunk_shape,
+                dtype=dtype,
+                fds=handles,
+                local_rank=runtime.rank,
+                world_size=len(handles),
+            )
+        finally:
+            for handle in handles:
+                os.close(handle)
 
     def duplicate_prefetch_handle(self) -> int:
         if self.closed:
@@ -200,10 +256,16 @@ class _ProjectionPool:
         if self.prefetch_export_handle is not None:
             os.close(self.prefetch_export_handle)
             self.prefetch_export_handle = None
+        if self.reduce_export_handle is not None:
+            os.close(self.reduce_export_handle)
+            self.reduce_export_handle = None
         self.owner_grad_buffers = None
         self.owner_grad_full = None
+        self.main_grad = None
+        self.owner_grad_allocation = None
         self.reduce_buffers = None
         self.reduce_full = None
+        self.reduce_allocation = None
         self.prefetch_allocation = None
 
 
@@ -286,10 +348,10 @@ class MoonEPSymmetricProjection:
         end = start + experts_per_rank
 
         # Keep only the locally owned base gradients and the local prefetch-slot
-        # gradients in FP32. ``owner_grad_full`` is a contiguous [E, ...] VMM
-        # mapping assembled from one [E/R, ...] allocation per rank, so the
-        # reduction kernel retains its global indexing contract without every
-        # rank materializing a full [E+B, ...] FP32 temporary.
+        # gradients in FP32. Both writes land in the pool's ``[E+B, ...]``
+        # mapping: ``owner_grad_full`` is its first E rows and
+        # ``reduce_buffers[rank]`` is the trailing B, so the reduction kernel
+        # keeps its global indexing contract.
         self.pool.owner_grad_buffers[rank].copy_(full_grad[start:end])
         self.pool.reduce_buffers[rank].copy_(
             full_grad[num_experts:num_experts + experts_per_rank]
