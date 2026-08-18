@@ -83,6 +83,12 @@ MOONEP_ASYNC_FINISH = os.environ.get("MOONEP_ASYNC_FINISH", "1").lower() in (
     "yes",
     "on",
 )
+MOONEP_ENABLE_PDL = os.environ.get("MOONEP_ENABLE_PDL", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Gradient monitoring. Set CLIP_GRAD>0 to clip; otherwise only log the norm.
 CLIP_GRAD = float(os.environ.get("CLIP_GRAD", "0"))
@@ -249,6 +255,7 @@ def get_moonep_fsdp_config(top_k: int) -> FSDPTurboConfig:
                     num_sms=MOONEP_NUM_SMS,
                     token_padding=MOONEP_TOKEN_PADDING,
                     async_finish=MOONEP_ASYNC_FINISH,
+                    enable_pdl=MOONEP_ENABLE_PDL,
                     tokens_per_rank=BATCH_SIZE * MAX_LENGTH,
                     top_k=top_k,
                 ),

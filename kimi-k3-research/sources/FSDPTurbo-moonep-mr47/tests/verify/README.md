@@ -9,6 +9,7 @@ PYTHONPATH=. python3 tests/verify/verify_opt1_main_grad_mapping.py
 PYTHONPATH=. python3 tests/verify/verify_opt2_grad_weight_sink.py
 PYTHONPATH=. python3 tests/verify/verify_opt3_weight_view_cache.py
 PYTHONPATH=. python3 tests/verify/verify_opt4_cuda_fused_weight_grad.py   # 仅 GPU 分支
+PYTHONPATH=. python3 tests/verify/verify_cuda_prefetch_event_wait.py      # GPU/NPU 共用 adapter
 ```
 
 每个脚本逐项打印 `PASS`/`FAIL`，全通过时最后一行是 `ALL PASS` 且退出码为 0；
@@ -87,6 +88,31 @@ mock 的 `torch_npu` 对拍，确保不传 sink 时与基线完全等价（可�
 
 CPU 上用模拟的 `grouped_mm` 覆盖融合与回退两条路径；装有 CUDA 时
 `tests/unit/test_moonep_cuda_weight_grad.py` 里还有一条真实设备用例。
+
+## CUDA prefetch Event.wait SIGSEGV（GPU/NPU 共用 adapter）
+
+`async_finish` 的 FSDPTurbo 包装 GPU/NPU 是同一份 Python。开源 MoonEP
+Buffer 只有 CUDA，NPU 跑不到 CuTe/PDL 这条 kernel，也复现不了 H20 上
+`Event.wait(accelerator stream)` 的 host SIGSEGV。
+
+对应 GPU 现象：`PYTHONFAULTHANDLER=1` 后堆栈停在
+
+```
+torch/cuda/streams.py:203  Event.wait
+moonep_adapter.py          prefetch
+```
+
+根因是 `done.wait(torch.accelerator.current_stream())`。CUDA 的
+`Event.wait` 是 `cudaStreamWaitEvent`，不能吃 device-agnostic 的
+accelerator Stream。应改成 `stream.wait_event(event)`。
+
+```
+[1/4] PASS  CUDA 路径调用 stream.wait_event, 不调用 event.wait
+[2/4] PASS  event 为 None 时是空操作
+[3/4] PASS  传入没有 wait_event 的 stream 时回退到 torch.cuda.current_stream()
+[4/4] PASS  adapter 源码不再把 accelerator stream 传给 Event.wait
+ALL PASS
+```
 
 ---
 
