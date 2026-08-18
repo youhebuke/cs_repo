@@ -106,3 +106,58 @@ def test_runtime_locks_shape_without_mutating_config(monkeypatch):
         runtime.new_call(tokens_per_rank=256, hidden_dim=128, top_k=4)
     with pytest.raises(RuntimeError, match="static top-k"):
         runtime.new_call(tokens_per_rank=512, hidden_dim=128, top_k=2)
+
+
+def test_dispatch_async_finish_is_forced_off_on_cuda():
+    cuda_runtime = SimpleNamespace(
+        accelerator_type="cuda",
+        config=SimpleNamespace(async_finish=True),
+    )
+    npu_runtime = SimpleNamespace(
+        accelerator_type="npu",
+        config=SimpleNamespace(async_finish=True),
+    )
+    assert moonep_adapter._dispatch_async_finish(cuda_runtime) is False
+    assert moonep_adapter._dispatch_async_finish(npu_runtime) is True
+
+
+def test_prefetch_makes_experts_contiguous():
+    import inspect
+
+    src = inspect.getsource(moonep_adapter.MoonEPSymmetricProjection.prefetch)
+    assert "experts.contiguous()" in src
+
+
+def test_cuda_dispatch_and_combine_use_dispatch_async_helper():
+    import inspect
+
+    dispatch_src = inspect.getsource(moonep_adapter._MoonEPDispatch)
+    combine_src = inspect.getsource(moonep_adapter._MoonEPWeightedCombine)
+    assert "_dispatch_async_finish" in dispatch_src
+    assert "_dispatch_async_finish" in combine_src
+    assert "async_finish=config.async_finish" not in dispatch_src
+    assert "async_finish=config.async_finish" not in combine_src
+
+
+def test_dispatcher_traces_first_layers_and_optional_debug_sync():
+    import inspect
+
+    from fsdp_turbo.distributed.expert_parallel import moonep_dispatcher
+
+    src = inspect.getsource(moonep_dispatcher.get_moonep_experts_forward_fn)
+    assert "_trace_stage" in src
+    assert "_debug_sync" in src
+    assert "before dispatch" in src
+    assert "after gmm.gate_up" in src
+
+
+def test_dispatcher_traces_first_layers_and_optional_debug_sync():
+    import inspect
+
+    from fsdp_turbo.distributed.expert_parallel import moonep_dispatcher
+
+    src = inspect.getsource(moonep_dispatcher.get_moonep_experts_forward_fn)
+    assert "_trace_stage" in src
+    assert "_debug_sync" in src
+    assert "before dispatch" in src
+    assert "after gmm.gate_up" in src
