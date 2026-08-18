@@ -10,10 +10,10 @@
 #   - 4+ GPUs on one NVLink/NVSwitch node (MoonEP requires intra-node EP)
 #   - MODEL_PATH / DATASET_PARQUET_PATH point to local Qwen3 MoE + wikitext
 
-# GPU: async_finish on the side comm stream SIGSEGVs (cooperative epilogue).
-# PDL on the default compute stream is fine. CUDA runtime also forces
-# async_finish=0 unless MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1.
-export MOONEP_ASYNC_FINISH=0
+# Default both flags on (same as NPU / MoonEPConfig). The H20 SIGSEGV was
+# Event.wait(accelerator stream) in the adapter, now Stream.wait_event.
+# Fallback only if a patched adapter still crashes:
+# export MOONEP_ASYNC_FINISH=0
 # export MOONEP_ENABLE_PDL=0
 
 export CUDA_VISIBLE_DEVICES=4,5,6,7

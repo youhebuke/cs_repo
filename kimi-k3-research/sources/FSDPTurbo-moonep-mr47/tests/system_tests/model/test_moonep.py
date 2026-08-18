@@ -77,14 +77,14 @@ EXPERT_PARALLEL_SIZE = int(os.environ.get("EXPERT_PARALLEL_SIZE", "8"))
 # MoonEP tuning
 MOONEP_NUM_SMS = int(os.environ.get("MOONEP_NUM_SMS", "32"))
 MOONEP_TOKEN_PADDING = int(os.environ.get("MOONEP_TOKEN_PADDING", "128"))
-MOONEP_ASYNC_FINISH = os.environ.get("MOONEP_ASYNC_FINISH", "0").lower() in (
+MOONEP_ASYNC_FINISH = os.environ.get("MOONEP_ASYNC_FINISH", "1").lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
-# PDL is safe on the default compute stream. The SIGSEGV comes from
-# async_finish putting a cooperative epilogue on the side comm stream.
+# Adapter wait/stream helpers are GPU/NPU shared. If CUDA still SIGSEGVs
+# after those helpers, set MOONEP_ASYNC_FINISH=0 as a fallback.
 MOONEP_ENABLE_PDL = os.environ.get("MOONEP_ENABLE_PDL", "1").lower() in (
     "1",
     "true",

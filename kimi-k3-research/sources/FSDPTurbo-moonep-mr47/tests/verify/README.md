@@ -109,9 +109,12 @@ MoonEP 训练路径不会走 OPT-4：dispatch buffer 与 `[E+B]` 权重都是 VM
 ALL PASS
 ```
 
-H20 上实测：`async_finish=0` + `enable_pdl=1` 能跑；`async_finish=1` 即使关掉
-PDL 也会 SIGSEGV。CUDA 运行时因此只强制 `async_finish=0`，PDL 保留。
-实验 comm-stream overlap 时设 `MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1`。
+`async_finish` 的 FSDPTurbo 包装 GPU/NPU 是同一份 Python；开源 MoonEP 0.0.1
+只有 CUDA Buffer（`torch.cuda.Stream` + CuTe），NPU 跑不到这条 kernel。
+H20 上 `async_finish=1` 的 SIGSEGV 是 adapter 里
+`Event.wait(torch.accelerator.current_stream())`，不是 GPU 单独关 flag，
+也不是已证实的 cooperative-epilogue-on-side-stream。PDL 可保持默认开。
+修复后 CUDA/NPU 都按配置传递 `async_finish` / `enable_pdl`。
 
 上机若仍 SIGSEGV，在脚本里打开 `MOONEP_DEBUG_SYNC=1`：最后一条
 `MoonEP debug sync after <stage>` 就是崩溃点。若从未打印 `dispatch`，

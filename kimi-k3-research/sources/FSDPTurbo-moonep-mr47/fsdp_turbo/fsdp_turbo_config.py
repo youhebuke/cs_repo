@@ -146,8 +146,9 @@ class MoonEPConfig:
     num_sms: int = 32
     token_padding: int = 128
     comm_stream_priority: int = -1
-    # CUDA keeps enable_pdl but forces async_finish=False at runtime: the
-    # dispatch epilogue is cooperative and SIGSEGVs on Buffer's comm stream.
+    # Shared GPU/NPU flags. Open-source MoonEP only implements the CUDA Buffer
+    # path; FSDPTurbo must not special-case CUDA by forcing async_finish off.
+    # The H20 crash was Event.wait(accelerator stream) in the adapter.
     enable_pdl: bool = True
     async_finish: bool = True
     tokens_per_rank: Optional[int] = None

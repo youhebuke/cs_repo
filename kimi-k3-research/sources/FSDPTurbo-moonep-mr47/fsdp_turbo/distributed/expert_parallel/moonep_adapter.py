@@ -82,33 +82,28 @@ def _wait_event(event, stream=None) -> None:
     event.wait(stream)
 
 
-def _cuda_safe_comm_flags(
-    accelerator_type: str, enable_pdl: bool, async_finish: bool
-) -> tuple[bool, bool]:
-    """Keep PDL; disable CUDA comm-stream overlap that SIGSEGVs on Hopper.
+def _comm_flags(enable_pdl: bool, async_finish: bool) -> tuple[bool, bool]:
+    """Pass ``enable_pdl`` / ``async_finish`` through for CUDA and NPU alike.
 
-    H20 experiment: ``async_finish=0`` + ``enable_pdl=1`` trains; the opposite
-    (async on, PDL off) host-SIGSEGVs. MoonEP's dispatch epilogue is a
-    *cooperative* launch (``grid=num_sms_dedup``). ``async_finish=True`` moves
-    that launch onto Buffer's high-priority side comm stream, which Hopper
-    rejects. PDL itself is safe on the default compute stream.
+    FSDPTurbo's MoonEP adapter is shared. Open-source MoonEP 0.0.1 is CUDA-only
+    (``torch.cuda.Stream``, CuTe cooperative grids, PDL). There is no NPU clone
+    of Buffer.async_finish; constructing that Buffer on NPU fails earlier, at
+    ``torch.cuda.Stream``.
 
-    NPU keeps the caller's flags. Set ``MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1``
-    to skip the CUDA override.
+    The H20 SIGSEGV with ``async_finish=True`` was this wrapper, not MoonEP's
+    stream hop and not a GPU/NPU flag split:
+
+    * ``Event.wait(torch.accelerator.current_stream())`` — CUDA Event.wait is
+      ``cudaStreamWaitEvent`` and SIGSEGVs on PyTorch 2.9's device-agnostic
+      Stream. Official MoonEP waits with ``event.wait(torch.cuda.current_stream())``.
+    * ``torch.accelerator.stream(cuda.Stream)`` — CuTe launches read
+      ``torch.cuda.current_stream()``, so the native CUDA context manager is
+      required.
+
+    NPU does not execute those CUDA Event/CuTe launches, so it cannot reproduce
+    this host SIGSEGV. Both accelerators keep the caller's flags.
     """
-    if accelerator_type != "cuda":
-        return bool(enable_pdl), bool(async_finish)
-    override = os.environ.get("MOONEP_ALLOW_UNSAFE_CUDA_ASYNC", "").lower()
-    if override in {"1", "true", "yes", "on"}:
-        return bool(enable_pdl), bool(async_finish)
-    if async_finish:
-        logger.warning(
-            "MoonEP CUDA forces async_finish=0: the dispatch epilogue is a "
-            "cooperative kernel and cannot run on the side comm stream "
-            "(SIGSEGV on Hopper). enable_pdl is left unchanged. Set "
-            "MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1 to override."
-        )
-    return bool(enable_pdl), False
+    return bool(enable_pdl), bool(async_finish)
 
 
 class MoonEPRuntimeConfig(Protocol):
@@ -630,8 +625,8 @@ class MoonEPRuntime:
         self.config = config
         self._tokens_per_rank = config.tokens_per_rank
         self._top_k = config.top_k
-        self.enable_pdl, self.async_finish = _cuda_safe_comm_flags(
-            accelerator.type, config.enable_pdl, config.async_finish
+        self.enable_pdl, self.async_finish = _comm_flags(
+            config.enable_pdl, config.async_finish
         )
         self.closed = False
         self._buffers: dict[tuple[int, int, int], Any] = {}
