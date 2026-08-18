@@ -18,6 +18,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
+from fsdp_turbo.ops.grad_weight_sink import GradWeightSink
+
 if TYPE_CHECKING:
     from torch.distributed import DeviceMesh
 
@@ -147,7 +149,14 @@ def _validate_projection_shape(
 
 
 class _ProjectionPool:
-    """Process-local prefetch slots and rank-mapped FP32 gradient slots."""
+    """Process-local prefetch slots and rank-mapped FP32 gradient slots.
+
+    NPU uses one contiguous ``[E+B, out, in]`` FP32 mapping: rows ``[0, E)``
+    are every rank's parameter gradients and rows ``[E, E+B)`` alias this
+    rank's reduce slice. CUDA keeps the original MR#47 owner/reduce VMMs
+    (no extra ``[E+B]`` tensor) so the wrap matches the tree that already
+    trains on H20.
+    """
 
     def __init__(self, runtime: "MoonEPRuntime", role: str, shape: tuple[int, int]):
         self.runtime = runtime
@@ -156,16 +165,91 @@ class _ProjectionPool:
         self.closed = False
         experts_per_rank = runtime.experts_per_rank
         out_features, in_features = shape
+        chunk_shape = [experts_per_rank, out_features, in_features]
+        imports = runtime.imports
+        ranks = list(range(runtime.size))
 
-        allocation, export_handle, owned_handle = runtime.imports.nvl_dist_alloc(
-            shape=[experts_per_rank, out_features, in_features], dtype=torch.bfloat16
+        allocation, export_handle, owned_handle = imports.nvl_dist_alloc(
+            shape=chunk_shape, dtype=torch.bfloat16
         )
-        runtime.imports.nvl_release_mem_handle(owned_handle)
+        imports.nvl_release_mem_handle(owned_handle)
         self.prefetch_allocation = allocation
         self.prefetch_export_handle = export_handle
 
-        self.reduce_full = runtime.imports.create_nvl_dist_tensor(
-            [experts_per_rank, out_features, in_features],
+        if getattr(runtime, "accelerator_type", None) == "cuda":
+            self._init_cuda_grad_buffers(chunk_shape, experts_per_rank, out_features, in_features)
+        else:
+            self._init_aliased_grad_buffers(
+                chunk_shape, experts_per_rank, out_features, in_features, ranks
+            )
+        self.owner_grad_buffers[runtime.rank].zero_()
+        self.reduce_buffers[runtime.rank].zero_()
+        if self.main_grad is not None:
+            self.main_grad[runtime.num_experts:].zero_()
+        dist.barrier(group=runtime.group)
+
+    def _init_aliased_grad_buffers(
+        self,
+        chunk_shape: list[int],
+        experts_per_rank: int,
+        out_features: int,
+        in_features: int,
+        ranks: list[int],
+    ) -> None:
+        """NPU: one ``[E+B]`` VMM whose tail aliases this rank's reduce pages."""
+        runtime = self.runtime
+        imports = runtime.imports
+        reduce_allocation, reduce_handle, reduce_owned = imports.nvl_dist_alloc(
+            shape=chunk_shape, dtype=torch.float32
+        )
+        imports.nvl_release_mem_handle(reduce_owned)
+        self.reduce_allocation = reduce_allocation
+        self.reduce_export_handle = reduce_handle
+        self.reduce_full = self._map_across_ranks(
+            chunk_shape, torch.float32, os.dup(reduce_handle), ranks
+        )
+        self.reduce_buffers = self.reduce_full.view(
+            runtime.size, experts_per_rank, out_features, in_features
+        )
+
+        owner_allocation, owner_handle, owner_owned = imports.nvl_dist_alloc(
+            shape=chunk_shape, dtype=torch.float32
+        )
+        imports.nvl_release_mem_handle(owner_owned)
+        self.owner_grad_allocation = owner_allocation
+        self.main_grad = self._map_across_ranks(
+            chunk_shape,
+            torch.float32,
+            owner_handle,
+            ranks,
+            extra_handle=os.dup(reduce_handle),
+        )
+        self.owner_grad_full = self.main_grad[: runtime.num_experts]
+        self.owner_grad_buffers = self.owner_grad_full.view(
+            runtime.size, experts_per_rank, out_features, in_features
+        )
+
+    def _init_cuda_grad_buffers(
+        self,
+        chunk_shape: list[int],
+        experts_per_rank: int,
+        out_features: int,
+        in_features: int,
+    ) -> None:
+        """CUDA keeps original MR#47 ``create_nvl_dist_tensor`` owner/reduce maps.
+
+        The ``[E+B]`` alias and a regular ``torch.zeros([E+B])`` sink both
+        change wrap-time allocations versus the tree that already trains on
+        H20 with ``MOONEP_ASYNC_FINISH=0``. GPU is only a functional check.
+        """
+        runtime = self.runtime
+        imports = runtime.imports
+        self.main_grad = None
+        self.reduce_allocation = None
+        self.reduce_export_handle = None
+        self.owner_grad_allocation = None
+        self.reduce_full = imports.create_nvl_dist_tensor(
+            chunk_shape,
             torch.float32,
             runtime.rank,
             runtime.size,
@@ -174,8 +258,8 @@ class _ProjectionPool:
         self.reduce_buffers = self.reduce_full.view(
             runtime.size, experts_per_rank, out_features, in_features
         )
-        self.owner_grad_full = runtime.imports.create_nvl_dist_tensor(
-            [experts_per_rank, out_features, in_features],
+        self.owner_grad_full = imports.create_nvl_dist_tensor(
+            chunk_shape,
             torch.float32,
             runtime.rank,
             runtime.size,
@@ -184,9 +268,36 @@ class _ProjectionPool:
         self.owner_grad_buffers = self.owner_grad_full.view(
             runtime.size, experts_per_rank, out_features, in_features
         )
-        self.reduce_buffers[runtime.rank].zero_()
-        self.owner_grad_buffers[runtime.rank].zero_()
-        dist.barrier(group=runtime.group)
+
+    def _map_across_ranks(
+        self,
+        chunk_shape: list[int],
+        dtype: torch.dtype,
+        local_handle: int,
+        ranks: list[int],
+        extra_handle: int | None = None,
+    ) -> torch.Tensor:
+        """Map every rank's chunk, plus an optional local one, as one tensor."""
+        runtime = self.runtime
+        imports = runtime.imports
+        exchanged = imports.exchange_ipc_fds(
+            local_handle, ranks, runtime.rank, runtime.size, runtime.group
+        )
+        os.close(local_handle)
+        handles = [exchanged[rank] for rank in ranks]
+        if extra_handle is not None:
+            handles.append(extra_handle)
+        try:
+            return imports.nvl_dist_map(
+                chunk_shape=chunk_shape,
+                dtype=dtype,
+                fds=handles,
+                local_rank=runtime.rank,
+                world_size=len(handles),
+            )
+        finally:
+            for handle in handles:
+                os.close(handle)
 
     def duplicate_prefetch_handle(self) -> int:
         if self.closed:
@@ -200,10 +311,16 @@ class _ProjectionPool:
         if self.prefetch_export_handle is not None:
             os.close(self.prefetch_export_handle)
             self.prefetch_export_handle = None
+        if self.reduce_export_handle is not None:
+            os.close(self.reduce_export_handle)
+            self.reduce_export_handle = None
         self.owner_grad_buffers = None
         self.owner_grad_full = None
+        self.main_grad = None
+        self.owner_grad_allocation = None
         self.reduce_buffers = None
         self.reduce_full = None
+        self.reduce_allocation = None
         self.prefetch_allocation = None
 
 
@@ -220,6 +337,7 @@ class MoonEPSymmetricProjection:
         self.runtime = runtime
         self.role = role
         self.closed = False
+        self._grad_sink: GradWeightSink | None = None
         self.global_shape = tuple(source.shape)
         self.out_features = int(source.shape[-2])
         self.in_features = int(source.shape[-1])
@@ -278,49 +396,89 @@ class MoonEPSymmetricProjection:
             num_sms=self.runtime.config.num_sms,
         )
 
-    def reduce_gradient(self, full_grad: torch.Tensor, plan, comm_context: dict) -> torch.Tensor:
+    def grad_weight_sink(self) -> GradWeightSink:
+        """Expose the NPU ``[E+B]`` FP32 buffer the grouped matmul writes into.
+
+        CUDA uses the original MR#47 weight bridge and has no sink buffer.
+        """
+        if self.pool.main_grad is None:
+            raise RuntimeError(
+                "MoonEP CUDA wrap uses the original weight-gradient bridge; "
+                "there is no [E+B] sink buffer."
+            )
+        if self._grad_sink is None:
+            num_experts = self.runtime.num_experts
+            experts_per_rank = self.runtime.experts_per_rank
+            start = self.runtime.rank * experts_per_rank
+            self._grad_sink = GradWeightSink(
+                buffer=self.pool.main_grad,
+                row_ranges=(
+                    (start, start + experts_per_rank),
+                    (num_experts, num_experts + experts_per_rank),
+                ),
+            )
+        return self._grad_sink
+
+    def reduce_gradient(self, first, second, third):
+        """Reduce local expert gradients across ranks.
+
+        CUDA (original MR#47)::
+            reduce_gradient(full_grad, plan, comm_context)
+        NPU (``[E+B]`` sink)::
+            reduce_gradient(plan, comm_context, dtype)
+        """
+        if isinstance(first, torch.Tensor):
+            return self._reduce_gradient_from_full_grad(first, second, third)
+        return self._reduce_gradient_from_sink(first, second, third)
+
+    def _reduce_gradient_from_full_grad(
+        self, full_grad: torch.Tensor, plan, comm_context: dict
+    ) -> torch.Tensor:
         num_experts = self.runtime.num_experts
         rank = self.runtime.rank
         experts_per_rank = self.runtime.experts_per_rank
         start = rank * experts_per_rank
         end = start + experts_per_rank
 
-        # Keep only the locally owned base gradients and the local prefetch-slot
-        # gradients in FP32. ``owner_grad_full`` is a contiguous [E, ...] VMM
-        # mapping assembled from one [E/R, ...] allocation per rank, so the
-        # reduction kernel retains its global indexing contract without every
-        # rank materializing a full [E+B, ...] FP32 temporary.
         self.pool.owner_grad_buffers[rank].copy_(full_grad[start:end])
         self.pool.reduce_buffers[rank].copy_(
             full_grad[num_experts:num_experts + experts_per_rank]
         )
+        self._launch_grad_reduce(plan, comm_context)
+        return self.pool.owner_grad_buffers[rank].to(dtype=full_grad.dtype)
 
+    def _reduce_gradient_from_sink(
+        self, plan, comm_context: dict, dtype: torch.dtype
+    ) -> torch.Tensor:
+        rank = self.runtime.rank
+        experts_per_rank = self.runtime.experts_per_rank
+        start = rank * experts_per_rank
+        end = start + experts_per_rank
+        self._launch_grad_reduce(plan, comm_context)
+        return self.pool.main_grad[start:end].to(dtype=dtype)
+
+    def _launch_grad_reduce(self, plan, comm_context: dict) -> None:
         # ``launch_grad_reduce`` reads every rank's reduce slots before its
         # internal cross-rank barrier. Publish the local slot writes and wait
         # until every peer has done the same before any rank starts reading.
-        # This is required when autograd reaches the weight bridge at slightly
-        # different times on different ranks.
         self.runtime.imports.launch_inter_rank_sync(comm_context)
         self.runtime.imports.launch_grad_reduce(
             self.pool.owner_grad_full,
             self.pool.reduce_buffers,
             plan.experts_to_copy,
-            rank=rank,
+            rank=self.runtime.rank,
             num_sms=self.runtime.config.num_sms,
             meta_buf=comm_context["meta_buf"],
             meta_stride=int(comm_context["meta_chunk_padded"]),
             barrier_off=int(comm_context["BARRIER_OFF"]),
             grid_sync_bar=comm_context["grid_sync_bar"],
         )
-        # The pool is reused by other layers with the same projection shape.
-        # Casting back to the BF16 parameter dtype also gives autograd an
-        # independent, local-sized result before the pool is overwritten.
-        return self.pool.owner_grad_buffers[rank].to(dtype=full_grad.dtype)
 
     def close(self) -> None:
         if self.closed:
             return
         self.closed = True
+        self._grad_sink = None
         self.full_weight = None
         self.expert_allocation = None
 
@@ -328,10 +486,9 @@ class MoonEPSymmetricProjection:
 class _MoonEPWeightsBridge(torch.autograd.Function):
     """Connect both registered parameters to their full VMM mappings.
 
-    A single multi-output autograd node receives both projection gradients and
-    therefore launches the cross-rank reductions in the same order on every
-    rank. Independent bridge nodes could be scheduled in different orders and
-    deadlock MoonEP's internal barriers.
+    CUDA uses this original MR#47 bridge. A single multi-output autograd node
+    receives both projection gradients and therefore launches the cross-rank
+    reductions in the same order on every rank.
     """
 
     @staticmethod
@@ -363,7 +520,6 @@ class _MoonEPWeightsBridge(torch.autograd.Function):
             raise RuntimeError(
                 "MoonEP requires gradients for both gate_up_proj and down_proj."
             )
-        # Fixed ordering is part of the distributed protocol.
         with torch.profiler.record_function("moonep.grad_reduce"):
             local_down = ctx.down_projection.reduce_gradient(
                 grad_full_down, ctx.plan, ctx.comm_context
@@ -376,6 +532,57 @@ class _MoonEPWeightsBridge(torch.autograd.Function):
             local_down.to(ctx.down_dtype),
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class _MoonEPWeightGradBridge(torch.autograd.Function):
+    """Reduce both projections' weight gradients and hand them to autograd.
+
+    The node is applied to the dispatched activations, i.e. upstream of both
+    grouped matmuls, so in the backward pass it runs only once every expert
+    gradient has been written into the ``[E+B]`` buffers. A single multi-output
+    node also launches the cross-rank reductions in the same order on every
+    rank; independent nodes could be scheduled differently and deadlock
+    MoonEP's internal barriers.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        dispatched,
+        local_gate_up,
+        local_down,
+        gate_up_projection,
+        down_projection,
+        plan,
+        comm_context,
+    ):
+        ctx.gate_up_projection = gate_up_projection
+        ctx.down_projection = down_projection
+        ctx.plan = plan
+        ctx.comm_context = comm_context
+        ctx.gate_up_dtype = local_gate_up.dtype
+        ctx.down_dtype = local_down.dtype
+        return dispatched.as_strided(dispatched.shape, dispatched.stride())
+
+    @staticmethod
+    def backward(ctx, grad_dispatched):
+        # Fixed ordering is part of the distributed protocol.
+        with torch.profiler.record_function("moonep.grad_reduce"):
+            local_down = ctx.down_projection.reduce_gradient(
+                ctx.plan, ctx.comm_context, ctx.down_dtype
+            )
+            local_gate_up = ctx.gate_up_projection.reduce_gradient(
+                ctx.plan, ctx.comm_context, ctx.gate_up_dtype
+            )
+        return (
+            grad_dispatched,
+            local_gate_up,
+            local_down,
             None,
             None,
             None,
@@ -462,6 +669,7 @@ class MoonEPRuntime:
         self._tokens_per_rank = config.tokens_per_rank
         self._top_k = config.top_k
         self.closed = False
+        self._first_dispatch_synced = False
         self._buffers: dict[tuple[int, int, int], Any] = {}
         self._projection_pools: dict[tuple[str, int, int], _ProjectionPool] = {}
         self._projections: list[MoonEPSymmetricProjection] = []
@@ -496,6 +704,47 @@ class MoonEPRuntime:
         self._projections.append(projection)
         return projection
 
+    def _finish_overlapping_fsdp_collectives(self) -> None:
+        """Wait for in-flight FSDP allgathers before MoonEP NCCL or CuTe JIT.
+
+        ``test_moonep.py`` sets ``num_to_forward_prefetch=1``. That launches the
+        next layer's FSDP allgather on a side stream at the start of the current
+        layer. Creating a Buffer (EP ``dist.barrier`` / 1-element allreduce) or
+        JIT-compiling the first dispatch kernel holds the GIL while that
+        allgather still needs it, so the watchdog reports a 600s
+        ``_ALLGATHER_BASE`` timeout on ``mesh_fsdp`` and a 1-element allreduce
+        timeout on ``mesh_ep``. This wait is a functional guard, not a memory
+        optimization.
+        """
+        torch.accelerator.synchronize()
+
+    def _make_buffer(self, tokens_per_rank: int, hidden_dim: int, top_k: int):
+        self._finish_overlapping_fsdp_collectives()
+        return self.imports.Buffer(
+            S=tokens_per_rank,
+            H=hidden_dim,
+            K=top_k,
+            E=self.num_experts,
+            num_ep_ranks=self.size,
+            B=self.experts_per_rank,
+            num_sms=self.config.num_sms,
+            token_padding=self.config.token_padding,
+            group=self.group,
+            comm_stream_priority=self.config.comm_stream_priority,
+            enable_pdl=self.config.enable_pdl,
+            explicitly_destroy=True,
+        )
+
+    def ensure_comm_buffer(self, hidden_dim: int) -> None:
+        """Allocate the MoonEP Buffer during wrap, before FSDP forward prefetch."""
+        if self._tokens_per_rank is None or self._top_k is None:
+            return
+        key = (self._tokens_per_rank, hidden_dim, self._top_k)
+        if key not in self._buffers:
+            self._buffers[key] = self._make_buffer(
+                self._tokens_per_rank, hidden_dim, self._top_k
+            )
+
     def new_call(
         self,
         tokens_per_rank: int,
@@ -520,20 +769,7 @@ class MoonEPRuntime:
         key = (tokens_per_rank, hidden_dim, top_k)
         buffer = self._buffers.get(key)
         if buffer is None:
-            buffer = self.imports.Buffer(
-                S=tokens_per_rank,
-                H=hidden_dim,
-                K=top_k,
-                E=self.num_experts,
-                num_ep_ranks=self.size,
-                B=self.experts_per_rank,
-                num_sms=self.config.num_sms,
-                token_padding=self.config.token_padding,
-                group=self.group,
-                comm_stream_priority=self.config.comm_stream_priority,
-                enable_pdl=self.config.enable_pdl,
-                explicitly_destroy=True,
-            )
+            buffer = self._make_buffer(tokens_per_rank, hidden_dim, top_k)
             self._buffers[key] = buffer
         return MoonEPCallState(
             self, buffer, tokens_per_rank, hidden_dim, top_k
@@ -560,6 +796,9 @@ class _MoonEPDispatch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, route_weights, topk_experts, tokens_per_expert, state):
         config = state.runtime.config
+        if not state.runtime._first_dispatch_synced:
+            state.runtime._finish_overlapping_fsdp_collectives()
+            state.runtime._first_dispatch_synced = True
         with torch.profiler.record_function("moonep.dispatch.forward"):
             result = state.buffer.dispatch(
                 hidden,
@@ -671,6 +910,41 @@ def moonep_weighted_combine(
     )
 
 
+def moonep_bind_weight_grads(
+    dispatched: torch.Tensor,
+    gate_up_parameter: torch.Tensor,
+    down_parameter: torch.Tensor,
+    gate_up_projection: MoonEPSymmetricProjection,
+    down_projection: MoonEPSymmetricProjection,
+    plan,
+    comm_context: dict,
+) -> torch.Tensor:
+    """Route both projections' weight gradients back to their parameters.
+
+    Returns ``dispatched`` unchanged; the returned tensor must be the one fed
+    to the expert grouped matmuls so that the reduction runs after them.
+    """
+    local_gate_up = (
+        gate_up_parameter.to_local()
+        if isinstance(gate_up_parameter, DTensor)
+        else gate_up_parameter
+    )
+    local_down = (
+        down_parameter.to_local()
+        if isinstance(down_parameter, DTensor)
+        else down_parameter
+    )
+    return _MoonEPWeightGradBridge.apply(
+        dispatched,
+        local_gate_up,
+        local_down,
+        gate_up_projection,
+        down_projection,
+        plan,
+        comm_context,
+    )
+
+
 def moonep_weights_for_step(
     gate_up_parameter: torch.Tensor,
     down_parameter: torch.Tensor,
@@ -679,6 +953,7 @@ def moonep_weights_for_step(
     plan,
     comm_context: dict,
 ):
+    """CUDA original MR#47: expose full VMM weights inside autograd."""
     local_gate_up = (
         gate_up_parameter.to_local()
         if isinstance(gate_up_parameter, DTensor)

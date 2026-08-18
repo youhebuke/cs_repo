@@ -106,3 +106,45 @@ def test_runtime_locks_shape_without_mutating_config(monkeypatch):
         runtime.new_call(tokens_per_rank=256, hidden_dim=128, top_k=4)
     with pytest.raises(RuntimeError, match="static top-k"):
         runtime.new_call(tokens_per_rank=512, hidden_dim=128, top_k=2)
+
+
+def test_ensure_comm_buffer_is_noop_without_static_shape(monkeypatch):
+    imports = _patch_runtime_environment(monkeypatch, "cuda")
+    runtime = moonep_adapter.MoonEPRuntime(
+        group=object(), ep_mesh=None, num_experts=4, config=MoonEPConfig()
+    )
+
+    def should_not_create(**kwargs):
+        raise AssertionError("Buffer must not be created without S and K")
+
+    runtime.imports.Buffer = should_not_create
+    runtime.ensure_comm_buffer(128)
+    assert runtime._buffers == {}
+
+
+def test_ensure_comm_buffer_creates_once_when_shape_is_known(monkeypatch):
+    imports = _patch_runtime_environment(monkeypatch, "cuda")
+    config = MoonEPConfig(tokens_per_rank=512, top_k=8, num_sms=32)
+    runtime = moonep_adapter.MoonEPRuntime(
+        group=object(), ep_mesh=None, num_experts=4, config=config
+    )
+    created = []
+
+    def fake_buffer(**kwargs):
+        created.append(kwargs)
+        return object()
+
+    runtime.imports.Buffer = fake_buffer
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None, raising=False)
+
+    runtime.ensure_comm_buffer(2048)
+    runtime.ensure_comm_buffer(2048)
+
+    assert len(created) == 1
+    assert created[0]["S"] == 512
+    assert created[0]["H"] == 2048
+    assert created[0]["K"] == 8
+    assert created[0]["E"] == 4
+    call = runtime.new_call(tokens_per_rank=512, hidden_dim=2048, top_k=8)
+    assert call.buffer is runtime._buffers[(512, 2048, 8)]
+    assert len(created) == 1
