@@ -14,7 +14,6 @@ except ImportError:
 _SUPPORTS_OUTPUT_DTYPE = None
 
 
-
 def _weight_grad(inputs, grad_output, group_list, group_list_type, output_dtype):
     """Compute the per-group weight gradient as a ``[groups, in, out]`` tensor.
 
@@ -46,6 +45,49 @@ def _weight_grad(inputs, grad_output, group_list, group_list_type, output_dtype)
         return launch()
     _SUPPORTS_OUTPUT_DTYPE = True
     return result
+
+
+def _group_sizes_and_ends(group_list, group_list_type):
+    """Return ``(sizes, exclusive_ends)`` for the grouped-matmul split."""
+    if group_list_type == 1:
+        sizes = group_list
+        ends = torch.cumsum(sizes, dim=0)
+        return sizes, ends
+    ends = group_list
+    zeros = torch.zeros(1, device=ends.device, dtype=ends.dtype)
+    sizes = torch.diff(ends, prepend=zeros)
+    return sizes, ends
+
+
+def _write_local_weight_grads(sink, inputs, grad_output, group_list, group_list_type):
+    """Write wgrad into the locally owned rows of ``sink.buffer``.
+
+    ``npu_grouped_matmul`` has no safe ``out=`` into the full ``[E+B]``
+    symmetric mapping (that would store into remote ranks' rows). The
+    operator still returns a tensor, so this wrapper only launches it on
+    the groups this rank owns: owner experts and the local prefetch/reduce
+    slots. The return is ``2*(E/R)`` rows rather than ``E+B``, then a copy
+    into those local slices. Remote rows are never written.
+    """
+    sizes, ends = _group_sizes_and_ends(group_list, group_list_type)
+    # Backward is past FSDP prefetch; a host read of the split is safe here.
+    ends_host = ends.detach().cpu().tolist()
+    output_dtype = sink.buffer.dtype
+    for row_start, row_end in sink.row_ranges:
+        if row_end <= row_start:
+            continue
+        token_start = 0 if row_start == 0 else int(ends_host[row_start - 1])
+        token_end = int(ends_host[row_end - 1])
+        if token_end == token_start:
+            continue
+        partial = _weight_grad(
+            inputs[token_start:token_end],
+            grad_output[token_start:token_end],
+            sizes[row_start:row_end],
+            1,
+            output_dtype,
+        ).transpose(1, 2)
+        sink.buffer[row_start:row_end].copy_(partial)
 
 
 class GroupedMatmul(torch.autograd.Function):
@@ -93,25 +135,19 @@ class GroupedMatmul(torch.autograd.Function):
                                             group_list=group_list, split_item=2, group_type=0,
                                             group_list_type=group_list_type)[0]
 
-        # Calculate weight gradient (K split gmm): grad_weight = inp^T @ grad_output = [K, N].
-        # ``transpose`` restores the [output_dim, input_dim] convention as a view; stacking
-        # transposed chunks instead would copy the whole gradient a second time.
+        if sink is not None:
+            _write_local_weight_grads(
+                sink, inp, grad_output, group_list, group_list_type
+            )
+            return grad, None, None, None, None, None
+
+        # Baseline path: return a full weight gradient to autograd.
+        # ``transpose`` restores [output_dim, input_dim] as a view; stacking
+        # transposed chunks would copy the whole gradient a second time.
         grad_weight = _weight_grad(
-            inp,
-            grad_output,
-            group_list,
-            group_list_type,
-            sink.buffer.dtype if sink is not None else None,
+            inp, grad_output, group_list, group_list_type, None
         ).transpose(1, 2)
-
-        if sink is None:
-            return grad, grad_weight, None, None, None, None
-
-        # Only this rank's own rows are copied into the symmetric buffer; the
-        # remaining rows are remote ranks' gradients that must stay untouched.
-        for start, end in sink.row_ranges:
-            sink.buffer[start:end].copy_(grad_weight[start:end])
-        return grad, None, None, None, None, None
+        return grad, grad_weight, None, None, None, None
 
 
 @register_op('grouped_matmul', 'npu')

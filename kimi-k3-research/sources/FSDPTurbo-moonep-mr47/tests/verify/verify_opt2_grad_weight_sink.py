@@ -14,7 +14,7 @@ Expected output (exit code 0):
     [5/8] PASS  reduce_gradient 不再拷贝, 直接消费 main_grad 并返回独立张量
     [6/8] PASS  reduce 在两个 GMM 反向之后触发, 顺序固定为 down -> gate_up
     [7/8] PASS  端到端参数梯度与纯 autograd 参考逐位一致
-    [8/8] PASS  NPU 算子: 不传 sink 时与基线逐位一致; 传 sink 时只写本地行
+    [8/8] PASS  NPU 算子: 不传 sink 时与基线逐位一致; 传 sink 时只对本地 2*(E/R) 行做 GMM
     ALL PASS
 """
 
@@ -315,6 +315,8 @@ def check_end_to_end_gradients():
 # 8: the NPU operator, against a mocked torch_npu
 # --------------------------------------------------------------------------
 def _mock_torch_npu():
+    wgrad_group_counts = []
+
     def npu_grouped_matmul(x_list, w_list, bias=None, group_list=None, split_item=None,
                            group_type=None, group_list_type=None, output_dtype=None):
         x = x_list[0]
@@ -327,6 +329,7 @@ def _mock_torch_npu():
                     out[start:end] = x[start:end] @ w_list[group]
             return [out]
         if split_item == 3 and group_type == 2:
+            wgrad_group_counts.append(int(group_list.numel()))
             grad = w_list[0]
             result = x.new_zeros(len(starts), x.shape[0], grad.shape[1])
             for group, (start, end) in enumerate(zip(starts, ends)):
@@ -337,6 +340,7 @@ def _mock_torch_npu():
 
     module = types.ModuleType("torch_npu")
     module.npu_grouped_matmul = npu_grouped_matmul
+    module.wgrad_group_counts = wgrad_group_counts
     return module
 
 
@@ -371,6 +375,7 @@ def check_npu_operator():
     sink = _sink(TOTAL_ROWS, 6, 4, row_ranges=LOCAL_RANGES)
     sentinel = 9.0
     sink.buffer[0].fill_(sentinel)
+    sys.modules["torch_npu"].wgrad_group_counts.clear()
     sink_out = npu.GroupedMatmul.apply(
         sink_inputs, weights.clone(), None, group_sizes, 1, sink
     )
@@ -381,12 +386,14 @@ def check_npu_operator():
         for start, end in LOCAL_RANGES
         for row in range(start, end)
     )
+    wgrad_counts = sys.modules["torch_npu"].wgrad_group_counts
     check(
         torch.equal(base_out, sink_out)
         and torch.allclose(base_inputs.grad, sink_inputs.grad, atol=1e-6)
         and local_rows_match
-        and torch.equal(sink.buffer[0], torch.full((6, 4), sentinel)),
-        "NPU 算子: 不传 sink 时与基线逐位一致; 传 sink 时只写本地行",
+        and torch.equal(sink.buffer[0], torch.full((6, 4), sentinel))
+        and wgrad_counts == [2, 2],
+        "NPU 算子: 不传 sink 时与基线逐位一致; 传 sink 时只对本地 2*(E/R) 行做 GMM",
     )
 
 

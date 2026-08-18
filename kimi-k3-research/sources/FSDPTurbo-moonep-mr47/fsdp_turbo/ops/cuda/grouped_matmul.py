@@ -5,6 +5,43 @@ from fsdp_turbo.ops.grad_weight_sink import validate_sink, write_group_grads
 from fsdp_turbo.ops.registry import register_op
 
 
+def _grouped_mm(mat_a, mat_b, offs):
+    """Grouped GEMM. PT 2.9 has ``torch._grouped_mm``, not ``F.grouped_mm``.
+
+    Offsets stay on device. A ``.cpu()`` here deadlocks FSDP prefetch.
+    """
+    offs = offs.to(device=mat_a.device, dtype=torch.int32)
+    if offs.stride(0) != 1:
+        offs = offs.contiguous()
+
+    functional = getattr(F, "grouped_mm", None)
+    if functional is not None:
+        try:
+            return functional(mat_a, mat_b, offs=offs)
+        except TypeError:
+            return functional(mat_a, mat_b, offs)
+
+    torch_op = getattr(torch, "_grouped_mm", None)
+    if torch_op is not None:
+        try:
+            return torch_op(mat_a, mat_b, offs=offs)
+        except TypeError:
+            return torch_op(mat_a, mat_b, offs)
+
+    aten = getattr(torch.ops, "aten", None)
+    aten_op = getattr(aten, "_grouped_mm", None) if aten is not None else None
+    if aten_op is not None:
+        try:
+            return aten_op(mat_a, mat_b, offs=offs)
+        except TypeError:
+            return aten_op(mat_a, mat_b, offs)
+
+    raise AttributeError(
+        "No grouped GEMM on this PyTorch build: F.grouped_mm, "
+        "torch._grouped_mm and torch.ops.aten._grouped_mm are all missing"
+    )
+
+
 class GroupedMatmulCUDA(torch.autograd.Function):
     """
     CUDA fused grouped matmul backed by torch.nn.functional.grouped_mm.
@@ -22,7 +59,7 @@ class GroupedMatmulCUDA(torch.autograd.Function):
 
         # out = input @ weight.T  ->  mat_b = [num_groups, K, N]
         mat_b = weights.transpose(-2, -1)
-        output = F.grouped_mm(input_tensor, mat_b, offs=offs)
+        output = _grouped_mm(input_tensor, mat_b, offs)
 
         ctx.save_for_backward(input_tensor, weights, offs)
         ctx.sink = sink
@@ -38,7 +75,7 @@ class GroupedMatmulCUDA(torch.autograd.Function):
         grad_weight = None
         if ctx.needs_input_grad[0]:
             # grad_input = grad_output @ weight (per group).
-            grad_input = F.grouped_mm(grad_output, weights, offs=offs)
+            grad_input = _grouped_mm(grad_output, weights, offs)
 
         if sink is not None:
             # The weight gradient lands straight in MoonEP's [E+B] buffer, so no
