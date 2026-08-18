@@ -77,7 +77,15 @@ EXPERT_PARALLEL_SIZE = int(os.environ.get("EXPERT_PARALLEL_SIZE", "8"))
 # MoonEP tuning
 MOONEP_NUM_SMS = int(os.environ.get("MOONEP_NUM_SMS", "32"))
 MOONEP_TOKEN_PADDING = int(os.environ.get("MOONEP_TOKEN_PADDING", "128"))
+# NPU keeps the original default (1). GPU launch scripts must export
+# MOONEP_ASYNC_FINISH=0; the adapter also forces CUDA dispatch/combine off.
 MOONEP_ASYNC_FINISH = os.environ.get("MOONEP_ASYNC_FINISH", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+MOONEP_ENABLE_PDL = os.environ.get("MOONEP_ENABLE_PDL", "1").lower() in (
     "1",
     "true",
     "yes",
@@ -248,6 +256,7 @@ def get_moonep_fsdp_config(top_k: int) -> FSDPTurboConfig:
                 moonep_config=MoonEPConfig(
                     num_sms=MOONEP_NUM_SMS,
                     token_padding=MOONEP_TOKEN_PADDING,
+                    enable_pdl=MOONEP_ENABLE_PDL,
                     async_finish=MOONEP_ASYNC_FINISH,
                     tokens_per_rank=BATCH_SIZE * MAX_LENGTH,
                     top_k=top_k,
@@ -333,7 +342,8 @@ def train(
             "Starting randomly initialized Qwen3 training with "
             f"MoonEP={EXPERT_PARALLEL_SIZE}, FSDP={FULLY_SHARD_PARALLEL_SIZE}, "
             f"batch_size={BATCH_SIZE}, sequence_length={MAX_LENGTH}, "
-            f"steps={NUM_STEPS}",
+            f"steps={NUM_STEPS}, async_finish={MOONEP_ASYNC_FINISH}, "
+            f"enable_pdl={MOONEP_ENABLE_PDL}",
         )
         if ENABLE_PROFILER:
             print_rank(
@@ -406,6 +416,16 @@ def train(
 
 def main() -> None:
     """Set up, train, and reliably release distributed MoonEP resources."""
+    from fsdp_turbo.distributed.expert_parallel import moonep_adapter
+
+    print(f"[probe] adapter {moonep_adapter.__file__}", flush=True)
+    try:
+        from fsdp_turbo.ops.cuda import grouped_matmul as cuda_gmm
+
+        print(f"[probe] cuda_gmm {cuda_gmm.__file__}", flush=True)
+    except Exception as exc:
+        print(f"[probe] cuda_gmm unavailable ({exc})", flush=True)
+
     model = None
     wrapped_model = None
     try:
