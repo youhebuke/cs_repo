@@ -83,7 +83,9 @@ MOONEP_ASYNC_FINISH = os.environ.get("MOONEP_ASYNC_FINISH", "0").lower() in (
     "yes",
     "on",
 )
-MOONEP_ENABLE_PDL = os.environ.get("MOONEP_ENABLE_PDL", "0").lower() in (
+# PDL is safe on the default compute stream. The SIGSEGV comes from
+# async_finish putting a cooperative epilogue on the side comm stream.
+MOONEP_ENABLE_PDL = os.environ.get("MOONEP_ENABLE_PDL", "1").lower() in (
     "1",
     "true",
     "yes",

@@ -109,9 +109,9 @@ MoonEP 训练路径不会走 OPT-4：dispatch buffer 与 `[E+B]` 权重都是 VM
 ALL PASS
 ```
 
-CUDA 上注释掉 `MOONEP_ASYNC_FINISH` / `MOONEP_ENABLE_PDL` 也会走同步路径：
-dispatch epilogue 是 cooperative kernel，不能放到 MoonEP 的旁路 comm stream，
-否则 Hopper 上 SIGSEGV。需要实验时设 `MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1`。
+H20 上实测：`async_finish=0` + `enable_pdl=1` 能跑；`async_finish=1` 即使关掉
+PDL 也会 SIGSEGV。CUDA 运行时因此只强制 `async_finish=0`，PDL 保留。
+实验 comm-stream overlap 时设 `MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1`。
 
 上机若仍 SIGSEGV，在脚本里打开 `MOONEP_DEBUG_SYNC=1`：最后一条
 `MoonEP debug sync after <stage>` 就是崩溃点。若从未打印 `dispatch`，

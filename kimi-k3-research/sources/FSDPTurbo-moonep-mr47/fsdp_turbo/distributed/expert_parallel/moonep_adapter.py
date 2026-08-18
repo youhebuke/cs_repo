@@ -85,13 +85,13 @@ def _wait_event(event, stream=None) -> None:
 def _cuda_safe_comm_flags(
     accelerator_type: str, enable_pdl: bool, async_finish: bool
 ) -> tuple[bool, bool]:
-    """Disable CUDA comm-stream / PDL flags that SIGSEGV on Hopper.
+    """Keep PDL; disable CUDA comm-stream overlap that SIGSEGVs on Hopper.
 
-    MoonEP's dispatch epilogue is a *cooperative* launch whose grid is
-    ``num_sms_dedup`` (78 on H20). ``async_finish=True`` moves that launch
-    onto Buffer's side comm stream; ``enable_pdl=True`` additionally chains
-    it with ``griddepcontrol`` from a 32-CTA predecessor. Either combination
-    host-SIGSEGVs on CUDA. The same workload runs with both flags off.
+    H20 experiment: ``async_finish=0`` + ``enable_pdl=1`` trains; the opposite
+    (async on, PDL off) host-SIGSEGVs. MoonEP's dispatch epilogue is a
+    *cooperative* launch (``grid=num_sms_dedup``). ``async_finish=True`` moves
+    that launch onto Buffer's high-priority side comm stream, which Hopper
+    rejects. PDL itself is safe on the default compute stream.
 
     NPU keeps the caller's flags. Set ``MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1``
     to skip the CUDA override.
@@ -101,14 +101,14 @@ def _cuda_safe_comm_flags(
     override = os.environ.get("MOONEP_ALLOW_UNSAFE_CUDA_ASYNC", "").lower()
     if override in {"1", "true", "yes", "on"}:
         return bool(enable_pdl), bool(async_finish)
-    if enable_pdl or async_finish:
+    if async_finish:
         logger.warning(
-            "MoonEP CUDA forces enable_pdl=0 and async_finish=0: the dispatch "
-            "epilogue is a cooperative kernel and PDL cannot run on the side "
-            "comm stream (SIGSEGV on Hopper). Set MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1 "
-            "to override."
+            "MoonEP CUDA forces async_finish=0: the dispatch epilogue is a "
+            "cooperative kernel and cannot run on the side comm stream "
+            "(SIGSEGV on Hopper). enable_pdl is left unchanged. Set "
+            "MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1 to override."
         )
-    return False, False
+    return bool(enable_pdl), False
 
 
 class MoonEPRuntimeConfig(Protocol):
