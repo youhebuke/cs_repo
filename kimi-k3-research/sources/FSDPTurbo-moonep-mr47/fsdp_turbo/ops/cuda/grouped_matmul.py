@@ -23,6 +23,8 @@ def _grouped_mm(mat_a, mat_b, offs):
 
     torch_op = getattr(torch, "_grouped_mm", None)
     if torch_op is not None:
+        if not mat_b.is_contiguous():
+            mat_b = mat_b.contiguous()
         try:
             return torch_op(mat_a, mat_b, offs=offs)
         except TypeError:
@@ -31,6 +33,8 @@ def _grouped_mm(mat_a, mat_b, offs):
     aten = getattr(torch.ops, "aten", None)
     aten_op = getattr(aten, "_grouped_mm", None) if aten is not None else None
     if aten_op is not None:
+        if not mat_b.is_contiguous():
+            mat_b = mat_b.contiguous()
         try:
             return aten_op(mat_a, mat_b, offs=offs)
         except TypeError:

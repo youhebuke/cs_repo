@@ -58,6 +58,7 @@ def build_pool():
     )
     runtime = SimpleNamespace(
         imports=imports,
+        accelerator_type="npu",
         rank=RANK,
         size=EP_SIZE,
         num_experts=NUM_EXPERTS,

@@ -149,17 +149,13 @@ def _validate_projection_shape(
 
 
 class _ProjectionPool:
-    """Process-local prefetch slots and the rank-mapped FP32 gradient buffer.
+    """Process-local prefetch slots and rank-mapped FP32 gradient slots.
 
-    The gradient side follows MoonEP's documented layout: one contiguous
-    ``[E+B, out, in]`` FP32 mapping whose rows ``[0, E)`` are every rank's
-    parameter gradients and whose rows ``[E, E+B)`` alias this rank's slice of
-    the reduce buffer. Handing that mapping to the grouped matmul lets the
-    backward pass accumulate in place instead of allocating a second full-size
-    gradient tensor and copying it in afterwards.
-
-    One pool is shared by every layer with the same projection shape, so the
-    extra memory is a fixed cost per shape rather than per layer.
+    NPU uses one contiguous ``[E+B, out, in]`` FP32 mapping: rows ``[0, E)``
+    are every rank's parameter gradients and rows ``[E, E+B)`` alias this
+    rank's reduce slice. CUDA keeps the original MR#47 owner/reduce VMMs
+    (no extra ``[E+B]`` tensor) so the wrap matches the tree that already
+    trains on H20.
     """
 
     def __init__(self, runtime: "MoonEPRuntime", role: str, shape: tuple[int, int]):
@@ -188,7 +184,8 @@ class _ProjectionPool:
             )
         self.owner_grad_buffers[runtime.rank].zero_()
         self.reduce_buffers[runtime.rank].zero_()
-        self.main_grad[runtime.num_experts:].zero_()
+        if self.main_grad is not None:
+            self.main_grad[runtime.num_experts:].zero_()
         dist.barrier(group=runtime.group)
 
     def _init_aliased_grad_buffers(
@@ -206,7 +203,6 @@ class _ProjectionPool:
             shape=chunk_shape, dtype=torch.float32
         )
         imports.nvl_release_mem_handle(reduce_owned)
-        self.cuda_local_sink = False
         self.reduce_allocation = reduce_allocation
         self.reduce_export_handle = reduce_handle
         self.reduce_full = self._map_across_ranks(
@@ -240,19 +236,15 @@ class _ProjectionPool:
         out_features: int,
         in_features: int,
     ) -> None:
-        """CUDA: do not ``cuMemMap`` the reduce allocation a second time.
+        """CUDA keeps original MR#47 ``create_nvl_dist_tensor`` owner/reduce maps.
 
-        Mapping the same POSIX handle into ``reduce_full`` and again as the
-        ``[E+B]`` tail leaves the CUDA VMM/multicast driver in a state where
-        the later Buffer planning kernel faults on ``multimem.st``. Peer ranks
-        then sit in ``cross_rank_barrier`` (phase=0, sign=1, target=0) until
-        the 100s trap. NPU aliasing is the memory win; GPU only needs the
-        same autograd graph, so the sink is a regular ``[E+B]`` tensor and
-        ``reduce_gradient`` copies into the original owner/reduce VMMs.
+        The ``[E+B]`` alias and a regular ``torch.zeros([E+B])`` sink both
+        change wrap-time allocations versus the tree that already trains on
+        H20 with ``MOONEP_ASYNC_FINISH=0``. GPU is only a functional check.
         """
         runtime = self.runtime
         imports = runtime.imports
-        self.cuda_local_sink = True
+        self.main_grad = None
         self.reduce_allocation = None
         self.reduce_export_handle = None
         self.owner_grad_allocation = None
@@ -275,11 +267,6 @@ class _ProjectionPool:
         )
         self.owner_grad_buffers = self.owner_grad_full.view(
             runtime.size, experts_per_rank, out_features, in_features
-        )
-        self.main_grad = torch.zeros(
-            (runtime.num_experts + experts_per_rank, out_features, in_features),
-            dtype=torch.float32,
-            device=self.reduce_full.device,
         )
 
     def _map_across_ranks(
@@ -410,13 +397,15 @@ class MoonEPSymmetricProjection:
         )
 
     def grad_weight_sink(self) -> GradWeightSink:
-        """Expose the ``[E+B]`` FP32 buffer the grouped matmul writes into.
+        """Expose the NPU ``[E+B]`` FP32 buffer the grouped matmul writes into.
 
-        Only the rows this rank physically owns are writable: its own experts
-        and the local prefetch slots. Every other row reaches a remote rank
-        through the symmetric mapping. The sink is cached so that any staging
-        buffer it allocates is reused for the lifetime of the projection.
+        CUDA uses the original MR#47 weight bridge and has no sink buffer.
         """
+        if self.pool.main_grad is None:
+            raise RuntimeError(
+                "MoonEP CUDA wrap uses the original weight-gradient bridge; "
+                "there is no [E+B] sink buffer."
+            )
         if self._grad_sink is None:
             num_experts = self.runtime.num_experts
             experts_per_rank = self.runtime.experts_per_rank
@@ -430,51 +419,60 @@ class MoonEPSymmetricProjection:
             )
         return self._grad_sink
 
-    def reduce_gradient(self, plan, comm_context: dict, dtype: torch.dtype) -> torch.Tensor:
+    def reduce_gradient(self, first, second, third):
+        """Reduce local expert gradients across ranks.
+
+        CUDA (original MR#47)::
+            reduce_gradient(full_grad, plan, comm_context)
+        NPU (``[E+B]`` sink)::
+            reduce_gradient(plan, comm_context, dtype)
+        """
+        if isinstance(first, torch.Tensor):
+            return self._reduce_gradient_from_full_grad(first, second, third)
+        return self._reduce_gradient_from_sink(first, second, third)
+
+    def _reduce_gradient_from_full_grad(
+        self, full_grad: torch.Tensor, plan, comm_context: dict
+    ) -> torch.Tensor:
+        num_experts = self.runtime.num_experts
         rank = self.runtime.rank
         experts_per_rank = self.runtime.experts_per_rank
         start = rank * experts_per_rank
         end = start + experts_per_rank
-        num_experts = self.runtime.num_experts
 
-        # On CUDA the sink is a regular [E+B] tensor. Copy the local rows into
-        # the owner/reduce VMMs before the collective kernel reads them.
-        if self.pool.cuda_local_sink:
-            self.pool.owner_grad_buffers[rank].copy_(self.pool.main_grad[start:end])
-            self.pool.reduce_buffers[rank].copy_(
-                self.pool.main_grad[num_experts:num_experts + experts_per_rank]
-            )
+        self.pool.owner_grad_buffers[rank].copy_(full_grad[start:end])
+        self.pool.reduce_buffers[rank].copy_(
+            full_grad[num_experts:num_experts + experts_per_rank]
+        )
+        self._launch_grad_reduce(plan, comm_context)
+        return self.pool.owner_grad_buffers[rank].to(dtype=full_grad.dtype)
 
-        # The grouped matmul already wrote this step's FP32 gradients into the
-        # [E+B] buffer: rows [0, E) are the owner ranks' gradients and rows
-        # [E, E+B) are this rank's reduce slots (aliased on NPU, copied on CUDA).
-        #
+    def _reduce_gradient_from_sink(
+        self, plan, comm_context: dict, dtype: torch.dtype
+    ) -> torch.Tensor:
+        rank = self.runtime.rank
+        experts_per_rank = self.runtime.experts_per_rank
+        start = rank * experts_per_rank
+        end = start + experts_per_rank
+        self._launch_grad_reduce(plan, comm_context)
+        return self.pool.main_grad[start:end].to(dtype=dtype)
+
+    def _launch_grad_reduce(self, plan, comm_context: dict) -> None:
         # ``launch_grad_reduce`` reads every rank's reduce slots before its
         # internal cross-rank barrier. Publish the local slot writes and wait
         # until every peer has done the same before any rank starts reading.
-        # This is required when autograd reaches the weight bridge at slightly
-        # different times on different ranks.
         self.runtime.imports.launch_inter_rank_sync(comm_context)
         self.runtime.imports.launch_grad_reduce(
             self.pool.owner_grad_full,
             self.pool.reduce_buffers,
             plan.experts_to_copy,
-            rank=rank,
+            rank=self.runtime.rank,
             num_sms=self.runtime.config.num_sms,
             meta_buf=comm_context["meta_buf"],
             meta_stride=int(comm_context["meta_chunk_padded"]),
             barrier_off=int(comm_context["BARRIER_OFF"]),
             grid_sync_bar=comm_context["grid_sync_bar"],
         )
-        # The pool is reused by other layers with the same projection shape.
-        # Casting back to the parameter dtype also gives autograd an
-        # independent, local-sized result before the pool is overwritten.
-        reduced = (
-            self.pool.owner_grad_buffers[rank]
-            if self.pool.cuda_local_sink
-            else self.pool.main_grad[start:end]
-        )
-        return reduced.to(dtype=dtype)
 
     def close(self) -> None:
         if self.closed:
@@ -483,6 +481,62 @@ class MoonEPSymmetricProjection:
         self._grad_sink = None
         self.full_weight = None
         self.expert_allocation = None
+
+
+class _MoonEPWeightsBridge(torch.autograd.Function):
+    """Connect both registered parameters to their full VMM mappings.
+
+    CUDA uses this original MR#47 bridge. A single multi-output autograd node
+    receives both projection gradients and therefore launches the cross-rank
+    reductions in the same order on every rank.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        local_gate_up,
+        local_down,
+        full_gate_up,
+        full_down,
+        gate_up_projection,
+        down_projection,
+        plan,
+        comm_context,
+    ):
+        ctx.gate_up_projection = gate_up_projection
+        ctx.down_projection = down_projection
+        ctx.plan = plan
+        ctx.comm_context = comm_context
+        ctx.gate_up_dtype = local_gate_up.dtype
+        ctx.down_dtype = local_down.dtype
+        return (
+            full_gate_up.as_strided(full_gate_up.shape, full_gate_up.stride()),
+            full_down.as_strided(full_down.shape, full_down.stride()),
+        )
+
+    @staticmethod
+    def backward(ctx, grad_full_gate_up, grad_full_down):
+        if grad_full_gate_up is None or grad_full_down is None:
+            raise RuntimeError(
+                "MoonEP requires gradients for both gate_up_proj and down_proj."
+            )
+        with torch.profiler.record_function("moonep.grad_reduce"):
+            local_down = ctx.down_projection.reduce_gradient(
+                grad_full_down, ctx.plan, ctx.comm_context
+            )
+            local_gate_up = ctx.gate_up_projection.reduce_gradient(
+                grad_full_gate_up, ctx.plan, ctx.comm_context
+            )
+        return (
+            local_gate_up.to(ctx.gate_up_dtype),
+            local_down.to(ctx.down_dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class _MoonEPWeightGradBridge(torch.autograd.Function):
@@ -852,6 +906,37 @@ def moonep_bind_weight_grads(
         dispatched,
         local_gate_up,
         local_down,
+        gate_up_projection,
+        down_projection,
+        plan,
+        comm_context,
+    )
+
+
+def moonep_weights_for_step(
+    gate_up_parameter: torch.Tensor,
+    down_parameter: torch.Tensor,
+    gate_up_projection: MoonEPSymmetricProjection,
+    down_projection: MoonEPSymmetricProjection,
+    plan,
+    comm_context: dict,
+):
+    """CUDA original MR#47: expose full VMM weights inside autograd."""
+    local_gate_up = (
+        gate_up_parameter.to_local()
+        if isinstance(gate_up_parameter, DTensor)
+        else gate_up_parameter
+    )
+    local_down = (
+        down_parameter.to_local()
+        if isinstance(down_parameter, DTensor)
+        else down_parameter
+    )
+    return _MoonEPWeightsBridge.apply(
+        local_gate_up,
+        local_down,
+        gate_up_projection.full_weight,
+        down_projection.full_weight,
         gate_up_projection,
         down_projection,
         plan,

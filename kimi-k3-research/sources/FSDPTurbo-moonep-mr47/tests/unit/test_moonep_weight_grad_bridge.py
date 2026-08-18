@@ -9,6 +9,7 @@ torch = pytest.importorskip("torch")
 from fsdp_turbo.distributed.expert_parallel.moonep_adapter import (
     MoonEPSymmetricProjection,
     moonep_bind_weight_grads,
+    moonep_weights_for_step,
 )
 from fsdp_turbo.distributed.expert_parallel.moonep_dispatcher import (
     _grouped_matmul_with_static_tail,
@@ -42,7 +43,6 @@ def _projection(events, name, out_features, in_features):
         reduce_buffers=main_grad[:NUM_EXPERTS].view(
             NUM_EXPERTS // EXPERTS_PER_RANK, EXPERTS_PER_RANK, out_features, in_features
         ),
-        cuda_local_sink=False,
     )
     projection.runtime = SimpleNamespace(
         imports=SimpleNamespace(
@@ -179,3 +179,72 @@ def test_expert_gradients_match_a_plain_autograd_reference():
         torch.testing.assert_close(
             projection.pool.main_grad[NUM_EXPERTS:], expected[NUM_EXPERTS:]
         )
+
+
+def _cuda_projection(events, name, out_features, in_features):
+    projection = object.__new__(MoonEPSymmetricProjection)
+    projection._grad_sink = None
+    owner_grad_full = torch.zeros(
+        NUM_EXPERTS, out_features, in_features, dtype=torch.float32
+    )
+    reduce_buffers = torch.zeros(
+        NUM_EXPERTS // EXPERTS_PER_RANK,
+        EXPERTS_PER_RANK,
+        out_features,
+        in_features,
+        dtype=torch.float32,
+    )
+    projection.pool = SimpleNamespace(
+        main_grad=None,
+        owner_grad_full=owner_grad_full,
+        owner_grad_buffers=owner_grad_full.view(
+            NUM_EXPERTS // EXPERTS_PER_RANK,
+            EXPERTS_PER_RANK,
+            out_features,
+            in_features,
+        ),
+        reduce_buffers=reduce_buffers,
+    )
+    projection.runtime = SimpleNamespace(
+        imports=SimpleNamespace(
+            launch_inter_rank_sync=lambda comm_context: events.append(f"sync:{name}"),
+            launch_grad_reduce=lambda *args, **kwargs: events.append(f"reduce:{name}"),
+        ),
+        num_experts=NUM_EXPERTS,
+        rank=RANK,
+        experts_per_rank=EXPERTS_PER_RANK,
+        config=SimpleNamespace(num_sms=8),
+    )
+    projection.full_weight = torch.randn(TOTAL_ROWS, out_features, in_features)
+    return projection
+
+
+def test_cuda_weights_for_step_reduces_after_both_matmuls():
+    events = []
+    hidden_dim, intermediate, tokens = 4, 6, 6
+    torch.manual_seed(0)
+    gate_up = _cuda_projection(events, "gate_up", intermediate, hidden_dim)
+    down = _cuda_projection(events, "down", hidden_dim, intermediate)
+    gate_up_param = torch.nn.Parameter(
+        gate_up.full_weight[LOCAL_START:LOCAL_END].clone()
+    )
+    down_param = torch.nn.Parameter(down.full_weight[LOCAL_START:LOCAL_END].clone())
+    cu_seqlens = torch.tensor([0, 0, 3, 5, 5, tokens], dtype=torch.int32)
+    dispatched = torch.randn(tokens, hidden_dim, requires_grad=True)
+
+    gate_up_weight, down_weight = moonep_weights_for_step(
+        gate_up_param, down_param, gate_up, down, PLAN, COMM_CONTEXT
+    )
+    fc1 = _grouped_matmul_with_static_tail(dispatched, cu_seqlens, gate_up_weight)
+    output = _grouped_matmul_with_static_tail(
+        torch.nn.functional.silu(fc1).contiguous(), cu_seqlens, down_weight
+    )
+    output.sum().backward()
+
+    assert events == ["sync:down", "reduce:down", "sync:gate_up", "reduce:gate_up"]
+    assert gate_up_param.grad is not None
+    assert down_param.grad is not None
+    assert gate_up_param.grad.shape == gate_up_param.shape
+    assert down_param.grad.shape == down_param.shape
+    with pytest.raises(RuntimeError, match="no \\[E\\+B\\] sink buffer"):
+        gate_up.grad_weight_sink()

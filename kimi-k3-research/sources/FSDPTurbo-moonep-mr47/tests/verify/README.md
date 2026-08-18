@@ -38,9 +38,9 @@ PYTHONPATH=. python3 tests/verify/verify_opt2_grad_weight_sink.py
 
 ## GPU 功能（不要当显存优化）
 
-H20 / PT 2.9 没有 `F.grouped_mm`，CUDA 路径回退 `torch._grouped_mm`。
+CUDA 训练图与原始 MR#47 相同：`create_nvl_dist_tensor` owner/reduce，`moonep_weights_for_step`，GMM 不走 sink。H20 / PT 2.9 没有 `F.grouped_mm` 时回退 `torch._grouped_mm`。
 
-CUDA 不能把同一块 reduce 分配再 `cuMemMap` 进 `[E+B]` 尾部：第二次 map 会把后续 Buffer 的 multicast / `multimem.st` 搞坏，第一次 planning 卡在 `cross_rank_barrier`（phase=0, sign=1, target=0）。GPU 上 `main_grad` 改用普通 `[E+B]` FP32 tensor，`reduce_gradient` 再 copy 进原来的 owner/reduce VMM。NPU 仍走对称别名，这不是 GPU 显存优化。
+`[E+B]` VMM 别名和 GradWeightSink 只在 NPU 上启用。
 
 启动时导出 `MOONEP_ASYNC_FINISH=0`（和原始 MR#47 一样）。
 

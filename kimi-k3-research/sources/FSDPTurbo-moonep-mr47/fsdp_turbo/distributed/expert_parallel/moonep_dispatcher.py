@@ -10,6 +10,7 @@ from fsdp_turbo.distributed.expert_parallel.moonep_adapter import (
     moonep_bind_weight_grads,
     moonep_dispatch,
     moonep_weighted_combine,
+    moonep_weights_for_step,
 )
 from fsdp_turbo.distributed.expert_parallel.utils import (
     fixed_router_for_debug,
@@ -181,25 +182,41 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
         )
         call.prefetch(self._moonep_gate_up, self._moonep_down)
 
-        # Binding the parameters here, upstream of both grouped matmuls, makes
-        # the cross-rank gradient reduction the last node of this layer's
-        # backward pass, once both projections have written their gradients
-        # into the [E+B] buffers.
-        dispatched = moonep_bind_weight_grads(
-            dispatched,
-            self.gate_up_proj,
-            self.down_proj,
-            self._moonep_gate_up,
-            self._moonep_down,
-            call.plan,
-            call.comm_context,
-        )
+        # CUDA keeps the original MR#47 autograd graph: weights stay in the
+        # graph and backward copies the full grad into owner/reduce VMMs.
+        # NPU binds a GradWeightSink so the grouped matmul writes [E+B] in
+        # place and the reduction consumes that buffer.
+        if runtime.accelerator_type == "cuda":
+            gate_up_weight, down_weight = moonep_weights_for_step(
+                self.gate_up_proj,
+                self.down_proj,
+                self._moonep_gate_up,
+                self._moonep_down,
+                call.plan,
+                call.comm_context,
+            )
+            gate_up_sink = None
+            down_sink = None
+        else:
+            dispatched = moonep_bind_weight_grads(
+                dispatched,
+                self.gate_up_proj,
+                self.down_proj,
+                self._moonep_gate_up,
+                self._moonep_down,
+                call.plan,
+                call.comm_context,
+            )
+            gate_up_weight = self._moonep_gate_up.full_weight
+            down_weight = self._moonep_down.full_weight
+            gate_up_sink = self._moonep_gate_up.grad_weight_sink()
+            down_sink = self._moonep_down.grad_weight_sink()
         with torch.profiler.record_function("moonep.gmm.gate_up"):
             fc1 = _grouped_matmul_with_static_tail(
                 dispatched,
                 call.cu_seqlens,
-                self._moonep_gate_up.full_weight,
-                grad_weight_sink=self._moonep_gate_up.grad_weight_sink(),
+                gate_up_weight,
+                grad_weight_sink=gate_up_sink,
             )
         fc1 = prefetch_before_backward(fc1, self._moonep_gate_up, call)
         gate, up = fc1.chunk(2, dim=-1)
@@ -212,8 +229,8 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
             expert_output = _grouped_matmul_with_static_tail(
                 activated.contiguous(),
                 call.cu_seqlens,
-                self._moonep_down.full_weight,
-                grad_weight_sink=self._moonep_down.grad_weight_sink(),
+                down_weight,
+                grad_weight_sink=down_sink,
             )
         expert_output = prefetch_before_backward(expert_output, self._moonep_down, call)
         output = moonep_weighted_combine(
