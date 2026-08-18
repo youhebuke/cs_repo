@@ -106,3 +106,61 @@ def test_runtime_locks_shape_without_mutating_config(monkeypatch):
         runtime.new_call(tokens_per_rank=256, hidden_dim=128, top_k=4)
     with pytest.raises(RuntimeError, match="static top-k"):
         runtime.new_call(tokens_per_rank=512, hidden_dim=128, top_k=2)
+
+
+def test_wait_event_on_cuda_uses_stream_wait_event_not_event_wait(monkeypatch):
+    """PyTorch 2.9 SIGSEGVs if cuda.Event.wait gets an accelerator Stream."""
+    calls = []
+
+    class FakeStream:
+        def wait_event(self, event):
+            calls.append(("stream.wait_event", event))
+
+    class FakeEvent:
+        def wait(self, stream):
+            calls.append(("event.wait", stream))
+
+    monkeypatch.setattr(moonep_adapter, "_is_cuda", lambda: True)
+    event = FakeEvent()
+    stream = FakeStream()
+    moonep_adapter._wait_event(event, stream)
+    moonep_adapter._wait_event(None, stream)
+
+    assert calls == [("stream.wait_event", event)]
+
+
+def test_wait_event_on_npu_prefers_stream_wait_event(monkeypatch):
+    calls = []
+
+    class FakeStream:
+        def wait_event(self, event):
+            calls.append(("stream.wait_event", event))
+
+    class FakeEvent:
+        def wait(self, stream):
+            calls.append(("event.wait", stream))
+
+    monkeypatch.setattr(moonep_adapter, "_is_cuda", lambda: False)
+    event = FakeEvent()
+    stream = FakeStream()
+    moonep_adapter._wait_event(event, stream)
+
+    assert calls == [("stream.wait_event", event)]
+
+
+def test_wait_event_on_npu_falls_back_to_event_wait(monkeypatch):
+    calls = []
+
+    class FakeStream:
+        pass
+
+    class FakeEvent:
+        def wait(self, stream):
+            calls.append(("event.wait", stream))
+
+    monkeypatch.setattr(moonep_adapter, "_is_cuda", lambda: False)
+    event = FakeEvent()
+    stream = FakeStream()
+    moonep_adapter._wait_event(event, stream)
+
+    assert calls == [("event.wait", stream)]

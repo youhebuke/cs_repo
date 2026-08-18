@@ -10,6 +10,7 @@ PYTHONPATH=. python3 tests/verify/verify_opt2_grad_weight_sink.py
 PYTHONPATH=. python3 tests/verify/verify_opt3_weight_view_cache.py
 PYTHONPATH=. python3 tests/verify/verify_opt4_cuda_fused_weight_grad.py   # 仅 GPU 分支
 PYTHONPATH=. python3 tests/verify/verify_cuda_vmm_safe_grouped_matmul.py  # 仅 GPU 分支
+PYTHONPATH=. python3 tests/verify/verify_cuda_prefetch_event_wait.py      # 仅 GPU 分支
 ```
 
 每个脚本逐项打印 `PASS`/`FAIL`，全通过时最后一行是 `ALL PASS` 且退出码为 0；
@@ -111,6 +112,28 @@ ALL PASS
 上机若仍 SIGSEGV，在脚本里打开 `MOONEP_DEBUG_SYNC=1`：最后一条
 `MoonEP debug sync after <stage>` 就是崩溃点。若从未打印 `dispatch`，
 崩溃在 MoonEP 自己的 dispatch kernel，而不是 grouped matmul。
+
+## CUDA prefetch Event.wait SIGSEGV（GPU 正确性修复）
+
+对应现象：`PYTHONFAULTHANDLER=1` 后堆栈停在
+
+```
+torch/cuda/streams.py:203  Event.wait
+moonep_adapter.py          prefetch
+```
+
+根因是 `done.wait(torch.accelerator.current_stream())`。CUDA 的
+`Event.wait` 是 `cudaStreamWaitEvent`，不能吃 device-agnostic 的
+accelerator Stream，PyTorch 2.9 上会直接 SIGSEGV。应改成
+`cuda.Stream.wait_event(event)`，与 Domino 一致。
+
+```
+[1/4] PASS  CUDA 路径调用 stream.wait_event, 不调用 event.wait
+[2/4] PASS  event 为 None 时是空操作
+[3/4] PASS  传入没有 wait_event 的 stream 时回退到 torch.cuda.current_stream()
+[4/4] PASS  adapter 源码不再把 accelerator stream 传给 Event.wait
+ALL PASS
+```
 
 ---
 
