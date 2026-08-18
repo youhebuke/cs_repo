@@ -21,10 +21,11 @@ def _grouped_mm(mat_a, mat_b, offs):
         except TypeError:
             return functional(mat_a, mat_b, offs)
 
+    if not mat_b.is_contiguous():
+        mat_b = mat_b.contiguous()
+
     torch_op = getattr(torch, "_grouped_mm", None)
     if torch_op is not None:
-        if not mat_b.is_contiguous():
-            mat_b = mat_b.contiguous()
         try:
             return torch_op(mat_a, mat_b, offs=offs)
         except TypeError:
@@ -33,8 +34,6 @@ def _grouped_mm(mat_a, mat_b, offs):
     aten = getattr(torch.ops, "aten", None)
     aten_op = getattr(aten, "_grouped_mm", None) if aten is not None else None
     if aten_op is not None:
-        if not mat_b.is_contiguous():
-            mat_b = mat_b.contiguous()
         try:
             return aten_op(mat_a, mat_b, offs=offs)
         except TypeError:
@@ -111,4 +110,5 @@ class GroupedMatmulCUDA(torch.autograd.Function):
 def grouped_matmul_cuda(inputs, m_split, weights, grad_weight_sink=None):
     if grad_weight_sink is not None:
         validate_sink(grad_weight_sink, weights)
-    return GroupedMatmulCUDA.apply(inputs, weights, m_split, grad_weight_sink)
+        return GroupedMatmulCUDA.apply(inputs, weights, m_split, grad_weight_sink)
+    return GroupedMatmulCUDA.apply(inputs, weights, m_split)

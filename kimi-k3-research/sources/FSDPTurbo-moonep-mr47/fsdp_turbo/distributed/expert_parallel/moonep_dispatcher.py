@@ -57,12 +57,15 @@ def _grouped_matmul_with_static_tail(
         [torch.zeros_like(cumulative_group_ends[:1]), cumulative_group_ends[:-1]]
     )
     group_sizes = cumulative_group_ends - group_starts
+    kwargs = {}
+    if grad_weight_sink is not None:
+        kwargs["grad_weight_sink"] = grad_weight_sink
     return grouped_matmul(
         inputs,
         group_sizes,
         weights,
         use_eager=inputs.device.type == "cpu",
-        grad_weight_sink=grad_weight_sink,
+        **kwargs,
     )
 
 
@@ -115,6 +118,7 @@ def parallelize_moonep_module(module, runtime: MoonEPRuntime, ep_mesh, fixed_rou
     module.forward = types.MethodType(
         get_moonep_experts_forward_fn(runtime, fixed_router=fixed_router), module
     )
+    runtime.ensure_comm_buffer(int(module.hidden_dim))
 
 
 def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):

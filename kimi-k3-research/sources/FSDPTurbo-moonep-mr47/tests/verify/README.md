@@ -42,6 +42,8 @@ CUDA 训练图与原始 MR#47 相同：`create_nvl_dist_tensor` owner/reduce，`
 
 `[E+B]` VMM 别名和 GradWeightSink 只在 NPU 上启用。
 
+首次 `dispatch` 前会 `synchronize`，并把 comm Buffer 放到 wrap 阶段创建：`num_to_forward_prefetch=1` 时，CuTe JIT / EP barrier 和 FSDP allgather 抢 GIL 会变成 600s NCCL 超时。这不是显存优化。
+
 启动时导出 `MOONEP_ASYNC_FINISH=0`（和原始 MR#47 一样）。
 
 ```bash

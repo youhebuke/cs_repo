@@ -669,6 +669,7 @@ class MoonEPRuntime:
         self._tokens_per_rank = config.tokens_per_rank
         self._top_k = config.top_k
         self.closed = False
+        self._first_dispatch_synced = False
         self._buffers: dict[tuple[int, int, int], Any] = {}
         self._projection_pools: dict[tuple[str, int, int], _ProjectionPool] = {}
         self._projections: list[MoonEPSymmetricProjection] = []
@@ -703,6 +704,47 @@ class MoonEPRuntime:
         self._projections.append(projection)
         return projection
 
+    def _finish_overlapping_fsdp_collectives(self) -> None:
+        """Wait for in-flight FSDP allgathers before MoonEP NCCL or CuTe JIT.
+
+        ``test_moonep.py`` sets ``num_to_forward_prefetch=1``. That launches the
+        next layer's FSDP allgather on a side stream at the start of the current
+        layer. Creating a Buffer (EP ``dist.barrier`` / 1-element allreduce) or
+        JIT-compiling the first dispatch kernel holds the GIL while that
+        allgather still needs it, so the watchdog reports a 600s
+        ``_ALLGATHER_BASE`` timeout on ``mesh_fsdp`` and a 1-element allreduce
+        timeout on ``mesh_ep``. This wait is a functional guard, not a memory
+        optimization.
+        """
+        torch.accelerator.synchronize()
+
+    def _make_buffer(self, tokens_per_rank: int, hidden_dim: int, top_k: int):
+        self._finish_overlapping_fsdp_collectives()
+        return self.imports.Buffer(
+            S=tokens_per_rank,
+            H=hidden_dim,
+            K=top_k,
+            E=self.num_experts,
+            num_ep_ranks=self.size,
+            B=self.experts_per_rank,
+            num_sms=self.config.num_sms,
+            token_padding=self.config.token_padding,
+            group=self.group,
+            comm_stream_priority=self.config.comm_stream_priority,
+            enable_pdl=self.config.enable_pdl,
+            explicitly_destroy=True,
+        )
+
+    def ensure_comm_buffer(self, hidden_dim: int) -> None:
+        """Allocate the MoonEP Buffer during wrap, before FSDP forward prefetch."""
+        if self._tokens_per_rank is None or self._top_k is None:
+            return
+        key = (self._tokens_per_rank, hidden_dim, self._top_k)
+        if key not in self._buffers:
+            self._buffers[key] = self._make_buffer(
+                self._tokens_per_rank, hidden_dim, self._top_k
+            )
+
     def new_call(
         self,
         tokens_per_rank: int,
@@ -727,20 +769,7 @@ class MoonEPRuntime:
         key = (tokens_per_rank, hidden_dim, top_k)
         buffer = self._buffers.get(key)
         if buffer is None:
-            buffer = self.imports.Buffer(
-                S=tokens_per_rank,
-                H=hidden_dim,
-                K=top_k,
-                E=self.num_experts,
-                num_ep_ranks=self.size,
-                B=self.experts_per_rank,
-                num_sms=self.config.num_sms,
-                token_padding=self.config.token_padding,
-                group=self.group,
-                comm_stream_priority=self.config.comm_stream_priority,
-                enable_pdl=self.config.enable_pdl,
-                explicitly_destroy=True,
-            )
+            buffer = self._make_buffer(tokens_per_rank, hidden_dim, top_k)
             self._buffers[key] = buffer
         return MoonEPCallState(
             self, buffer, tokens_per_rank, hidden_dim, top_k
@@ -767,6 +796,9 @@ class _MoonEPDispatch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, route_weights, topk_experts, tokens_per_expert, state):
         config = state.runtime.config
+        if not state.runtime._first_dispatch_synced:
+            state.runtime._finish_overlapping_fsdp_collectives()
+            state.runtime._first_dispatch_synced = True
         with torch.profiler.record_function("moonep.dispatch.forward"):
             result = state.buffer.dispatch(
                 hidden,
