@@ -29,8 +29,9 @@ def grouped_matmul(
             backward pass writes the weight gradient into the sink's buffer and
             returns no autograd gradient for ``weights``.
         vmm_safe: When True, the CUDA backend uses per-expert ``torch.mm``
-            instead of ``F.grouped_mm``. Required for MoonEP's VMM-mapped
-            ``[E+B]`` weights; ignored on NPU/CPU.
+            instead of ``torch._grouped_mm``. That path ``.cpu()``s group
+            ends in forward and deadlocks FSDP prefetch; MoonEP training
+            must leave this False. Ignored on NPU/CPU.
 
     Returns:
         Result of grouped matrix multiplication

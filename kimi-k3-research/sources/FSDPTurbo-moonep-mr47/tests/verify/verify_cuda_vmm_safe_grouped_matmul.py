@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the CUDA MoonEP grouped matmul never calls F.grouped_mm.
+"""Verify CUDA grouped matmul: fused _grouped_mm vs vmm_safe escape hatch.
 
 Run from the repository root:
 
@@ -10,11 +10,12 @@ Expected output (exit code 0):
     [1/6] PASS  vmm_safe 前向不调用 grouped_mm, 结果与逐 expert 参考一致
     [2/6] PASS  空组被跳过, 输出对应行为 0
     [3/6] PASS  dgrad / wgrad 与参考一致, 仍不调用 grouped_mm
-    [4/6] PASS  sink 路径只写本地行, 且关闭融合 grouped_mm
-    [5/6] PASS  传入 sink 时即使未设 vmm_safe 也走安全路径
-    [6/6] PASS  非 MoonEP (无 sink, vmm_safe=False) 仍走 F.grouped_mm
+    [4/6] PASS  sink + vmm_safe 只写本地行, 且关闭融合 grouped_mm
+    [5/6] PASS  传入 sink 且未设 vmm_safe 时走 fused grouped_mm
+    [6/6] PASS  无 sink, vmm_safe=False 走 fused grouped_mm
 
-CPU 上用记录调用的 grouped_mm 替身覆盖两条路径。
+MoonEP 训练走 fused 路径（torch._grouped_mm / aten._grouped_mm），前向不得
+``.cpu()``。``vmm_safe=True`` 仍是逐 expert ``torch.mm`` 逃生舱。
 """
 
 import os
@@ -23,6 +24,9 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _repo_root import use_repo_checkout  # noqa: E402
+
+use_repo_checkout()
 
 from fsdp_turbo.ops.cuda import grouped_matmul as cuda_gmm  # noqa: E402
 from fsdp_turbo.ops.grad_weight_sink import GradWeightSink  # noqa: E402
@@ -46,7 +50,9 @@ class _RecordingGroupedMm:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, mat_a, mat_b, *, offs=None, out_dtype=None, bias=None):
+    def __call__(self, mat_a, mat_b, offs=None, *args, out_dtype=None, bias=None, **kwargs):
+        if offs is None and args:
+            offs = args[0]
         self.calls.append(
             (tuple(mat_a.shape), tuple(mat_b.shape), None if offs is None else offs.tolist())
         )
@@ -54,14 +60,18 @@ class _RecordingGroupedMm:
 
 
 def _with_grouped_mm(stub):
-    original = cuda_gmm.F.grouped_mm
+    original = getattr(cuda_gmm.F, "grouped_mm", None)
     cuda_gmm.F.grouped_mm = stub
     cuda_gmm._SUPPORTS_FUSED_WEIGHT_GRAD = None
     return original
 
 
 def _restore(original):
-    cuda_gmm.F.grouped_mm = original
+    if original is None:
+        if hasattr(cuda_gmm.F, "grouped_mm"):
+            delattr(cuda_gmm.F, "grouped_mm")
+    else:
+        cuda_gmm.F.grouped_mm = original
     cuda_gmm._SUPPORTS_FUSED_WEIGHT_GRAD = None
 
 
@@ -162,34 +172,42 @@ def check_sink_disables_fused_weight_grad():
         _restore(original)
     check(
         local_written and remote_clean and unused and no_weight_grad,
-        "sink 路径只写本地行, 且关闭融合 grouped_mm",
+        "sink + vmm_safe 只写本地行, 且关闭融合 grouped_mm",
     )
 
 
-def check_sink_implies_vmm_safe():
+def check_sink_without_vmm_safe_uses_fused_grouped_mm():
     inputs, weights = _fixture()
     sink = GradWeightSink(
         buffer=torch.zeros_like(weights, dtype=torch.float32),
         row_ranges=((0, 1), (2, 3)),
     )
-    stub = _RecordingGroupedMm()
+    stub = _CapturingGroupedMm()
     original = _with_grouped_mm(stub)
     try:
         output = cuda_gmm.grouped_matmul_cuda(
             inputs, M_SPLIT, weights, grad_weight_sink=sink
         )
         output.sum().backward()
-        unused = not stub.calls
+        used = stub.calls == [GROUP_ENDS, GROUP_ENDS]
+        local_written = sink.buffer[0].abs().sum() > 0 and sink.buffer[2].abs().sum() > 0
+        remote_clean = sink.buffer[1].abs().sum() == 0
+        no_weight_grad = weights.grad is None
     finally:
         _restore(original)
-    check(unused, "传入 sink 时即使未设 vmm_safe 也走安全路径")
+    check(
+        used and local_written and remote_clean and no_weight_grad,
+        "传入 sink 且未设 vmm_safe 时走 fused grouped_mm",
+    )
 
 
 class _CapturingGroupedMm:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, mat_a, mat_b, *, offs=None, out_dtype=None, bias=None):
+    def __call__(self, mat_a, mat_b, offs=None, *args, out_dtype=None, bias=None, **kwargs):
+        if offs is None and args:
+            offs = args[0]
         self.calls.append(offs.tolist() if offs is not None else None)
         # 2D x 3D grouped GEMM stand-in: mat_a [M,K], mat_b [G,K,N], offs [G]
         outputs = []
@@ -210,7 +228,7 @@ def check_fused_dispatcher_still_uses_grouped_mm():
         used = len(stub.calls) == 1 and stub.calls[0] == GROUP_ENDS
     finally:
         _restore(original)
-    check(matched and used, "非 MoonEP (无 sink, vmm_safe=False) 仍走 F.grouped_mm")
+    check(matched and used, "无 sink, vmm_safe=False 走 fused grouped_mm")
 
 
 def main() -> int:
@@ -218,7 +236,7 @@ def main() -> int:
     check_empty_group_is_zero()
     check_backward_matches_reference()
     check_sink_disables_fused_weight_grad()
-    check_sink_implies_vmm_safe()
+    check_sink_without_vmm_safe_uses_fused_grouped_mm()
     check_fused_dispatcher_still_uses_grouped_mm()
 
     failures = [message for passed, message in _checks if not passed]

@@ -23,6 +23,9 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _repo_root import use_repo_checkout  # noqa: E402
+
+use_repo_checkout()
 
 from fsdp_turbo.ops.cuda import grouped_matmul as cuda_gmm  # noqa: E402
 from fsdp_turbo.ops.grad_weight_sink import GradWeightSink  # noqa: E402
@@ -71,7 +74,9 @@ class _RecordingGroupedMm:
         self.calls = []
         self.fail = fail
 
-    def __call__(self, mat_a, mat_b, *, offs, out_dtype=None, bias=None):
+    def __call__(self, mat_a, mat_b, offs=None, *args, out_dtype=None, bias=None, **kwargs):
+        if offs is None and args:
+            offs = args[0]
         self.calls.append((tuple(mat_a.shape), tuple(mat_b.shape), offs.tolist()))
         if self.fail:
             raise RuntimeError("grouped_mm is unsupported on this device")
@@ -85,14 +90,18 @@ class _RecordingGroupedMm:
 
 
 def _with_grouped_mm(stub):
-    original = cuda_gmm.F.grouped_mm
+    original = getattr(cuda_gmm.F, "grouped_mm", None)
     cuda_gmm.F.grouped_mm = stub
     cuda_gmm._SUPPORTS_FUSED_WEIGHT_GRAD = None
     return original
 
 
 def _restore(original):
-    cuda_gmm.F.grouped_mm = original
+    if original is None:
+        if hasattr(cuda_gmm.F, "grouped_mm"):
+            delattr(cuda_gmm.F, "grouped_mm")
+    else:
+        cuda_gmm.F.grouped_mm = original
     cuda_gmm._SUPPORTS_FUSED_WEIGHT_GRAD = None
 
 

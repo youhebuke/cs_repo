@@ -72,15 +72,17 @@ def _grouped_matmul_with_static_tail(
         [torch.zeros_like(cumulative_group_ends[:1]), cumulative_group_ends[:-1]]
     )
     group_sizes = cumulative_group_ends - group_starts
-    # CUDA F.grouped_mm SIGSEGVs on MoonEP's VMM-mapped [E+B] weights
-    # (Hopper TMA + many empty groups). Force the per-expert torch.mm path.
+    # Keep ``group_sizes`` on device. The CUDA backend runs ``cumsum`` +
+    # ``torch._grouped_mm`` / ``aten._grouped_mm`` (PyTorch 2.9 has no
+    # ``F.grouped_mm``). A ``.cpu()`` here deadlocks FSDP prefetch all-gather.
+    # Do not pass ``vmm_safe=True``: that path D2Hs group ends for a Python
+    # ``torch.mm`` loop and hits the same hang.
     return grouped_matmul(
         inputs,
         group_sizes,
         weights,
         use_eager=inputs.device.type == "cpu",
         grad_weight_sink=grad_weight_sink,
-        vmm_safe=True,
     )
 
 

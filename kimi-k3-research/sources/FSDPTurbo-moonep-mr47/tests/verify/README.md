@@ -90,22 +90,26 @@ mock 的 `torch_npu` 对拍，确保不传 sink 时与基线完全等价（可�
 CPU 上用模拟的 `grouped_mm` 覆盖融合与回退两条路径；装有 CUDA 时
 `tests/unit/test_moonep_cuda_weight_grad.py` 里还有一条真实设备用例。
 
-MoonEP 训练路径不会走 OPT-4：dispatch buffer 与 `[E+B]` 权重都是 VMM
-映射，Hopper 上 `F.grouped_mm` 会 SIGSEGV。OPT-4 只保留给普通 CUDA 内存。
+MoonEP 训练的 sink 反向走 OPT-2 逐 group `torch.mm`（`use_fused=False`），
+不走 OPT-4：dispatch buffer 是 VMM 映射。OPT-4 仍可供普通 CUDA 内存探测。
 
-## CUDA VMM-safe grouped matmul（GPU 正确性修复）
+## CUDA fused grouped_mm（PyTorch 2.9）与 vmm_safe 逃生舱
 
-对应现象：`dispatcher="moonep"` 在 H20 等 Hopper GPU 上 rank SIGSEGV
-（exitcode -11），`dispatcher="fused"` 能跑通。根因是 CUDA 后端把 MoonEP
-的 VMM `[E+B]` 权重（大量空组）送进了 `F.grouped_mm`。
+PyTorch 2.9 没有 `F.grouped_mm`，但有 `torch._grouped_mm` 和
+`aten._grouped_mm`。MoonEP 训练前向必须走这条 fused 路径，offsets 留在 GPU。
+此前 `vmm_safe` 默认打开，前向 `_group_ends()` 里 `.cpu()`，会在 FSDP
+prefetch all-gather 进行时把某个 rank 卡在 D2H，其余 rank 进入 NCCL，
+最终 `mesh_fsdp` ALLGATHER vs `mesh_ep` ALLREDUCE 对不上，NCCL timeout 600s。
+
+`vmm_safe=True` 仍保留为逐 expert `torch.mm` 逃生舱，训练不要开。
 
 ```
 [1/6] PASS  vmm_safe 前向不调用 grouped_mm, 结果与逐 expert 参考一致
 [2/6] PASS  空组被跳过, 输出对应行为 0
 [3/6] PASS  dgrad / wgrad 与参考一致, 仍不调用 grouped_mm
-[4/6] PASS  sink 路径只写本地行, 且关闭融合 grouped_mm
-[5/6] PASS  传入 sink 时即使未设 vmm_safe 也走安全路径
-[6/6] PASS  非 MoonEP (无 sink, vmm_safe=False) 仍走 F.grouped_mm
+[4/6] PASS  sink + vmm_safe 只写本地行, 且关闭融合 grouped_mm
+[5/6] PASS  传入 sink 且未设 vmm_safe 时走 fused grouped_mm
+[6/6] PASS  无 sink, vmm_safe=False 走 fused grouped_mm
 ALL PASS
 ```
 
@@ -115,6 +119,7 @@ H20 上 `async_finish=1` 的 SIGSEGV 是 adapter 里
 `Event.wait(torch.accelerator.current_stream())`，不是 GPU 单独关 flag，
 也不是已证实的 cooperative-epilogue-on-side-stream。PDL 可保持默认开。
 修复后 CUDA/NPU 都按配置传递 `async_finish` / `enable_pdl`。
+训练请继续 `MOONEP_ASYNC_FINISH=0`，直到确认 `async_finish=1` 可跑。
 
 上机若仍 SIGSEGV，在脚本里打开 `MOONEP_DEBUG_SYNC=1`：最后一条
 `MoonEP debug sync after <stage>` 就是崩溃点。若从未打印 `dispatch`，

@@ -45,8 +45,10 @@ def _reference(grad_output, inputs):
     return expected
 
 
-def _emulate_grouped_mm(mat_a, mat_b, *, offs, out_dtype=None, bias=None):
+def _emulate_grouped_mm(mat_a, mat_b, offs=None, *args, out_dtype=None, bias=None, **kwargs):
     """CPU stand-in for the K-grouped ``grouped_mm`` used by the fused path."""
+    if offs is None and args:
+        offs = args[0]
     outputs = []
     start = 0
     for end in offs.tolist():
