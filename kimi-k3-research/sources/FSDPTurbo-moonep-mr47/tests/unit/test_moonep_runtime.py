@@ -75,6 +75,12 @@ def test_runtime_uses_the_same_moonep_api_for_accelerators(
 
     assert runtime.imports is imports
     assert runtime.accelerator_type == accelerator_type
+    if accelerator_type == "cuda":
+        assert runtime.async_finish is False
+        assert runtime.enable_pdl is False
+    else:
+        assert runtime.async_finish is True
+        assert runtime.enable_pdl is True
 
 
 def test_runtime_rejects_unsupported_accelerator(monkeypatch):
@@ -164,3 +170,14 @@ def test_wait_event_on_npu_falls_back_to_event_wait(monkeypatch):
     moonep_adapter._wait_event(event, stream)
 
     assert calls == [("event.wait", stream)]
+
+
+def test_cuda_safe_comm_flags_force_sync_without_pdl(monkeypatch):
+    monkeypatch.delenv("MOONEP_ALLOW_UNSAFE_CUDA_ASYNC", raising=False)
+    assert moonep_adapter._cuda_safe_comm_flags("cuda", True, True) == (False, False)
+    assert moonep_adapter._cuda_safe_comm_flags("npu", True, True) == (True, True)
+
+
+def test_cuda_safe_comm_flags_honor_unsafe_override(monkeypatch):
+    monkeypatch.setenv("MOONEP_ALLOW_UNSAFE_CUDA_ASYNC", "1")
+    assert moonep_adapter._cuda_safe_comm_flags("cuda", True, True) == (True, True)

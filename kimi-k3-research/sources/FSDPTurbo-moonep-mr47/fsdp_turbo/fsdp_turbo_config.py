@@ -146,6 +146,8 @@ class MoonEPConfig:
     num_sms: int = 32
     token_padding: int = 128
     comm_stream_priority: int = -1
+    # CUDA forces both False at runtime: the dispatch epilogue is a cooperative
+    # kernel and PDL is unsafe on MoonEP's side comm stream (Hopper SIGSEGV).
     enable_pdl: bool = True
     async_finish: bool = True
     tokens_per_rank: Optional[int] = None

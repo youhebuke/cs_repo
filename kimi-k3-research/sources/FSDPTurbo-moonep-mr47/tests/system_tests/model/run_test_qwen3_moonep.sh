@@ -10,10 +10,9 @@
 #   - 4+ GPUs on one NVLink/NVSwitch node (MoonEP requires intra-node EP)
 #   - MODEL_PATH / DATASET_PARQUET_PATH point to local Qwen3 MoE + wikitext
 
-# Diagnose native SIGSEGV:
-#   export MOONEP_DEBUG_SYNC=1 CUDA_LAUNCH_BLOCKING=1 PYTHONFAULTHANDLER=1
-# If prefetch still faults after the Event.wait fix:
-#   export MOONEP_ASYNC_FINISH=0 MOONEP_ENABLE_PDL=0
+# CUDA ignores async_finish/enable_pdl unless MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1.
+# Those two flags put a cooperative dispatch epilogue on the side comm stream
+# and SIGSEGV on Hopper. The tested-good path is both off (the CUDA default).
 
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 export FULLY_SHARD_PARALLEL_SIZE=4

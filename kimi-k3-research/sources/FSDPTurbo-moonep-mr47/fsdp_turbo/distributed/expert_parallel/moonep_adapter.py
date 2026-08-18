@@ -9,6 +9,7 @@ its optional accelerator extension.
 from __future__ import annotations
 
 import importlib.metadata
+import logging
 import os
 import socket
 from dataclasses import dataclass
@@ -24,6 +25,8 @@ from fsdp_turbo.ops.weight_views import release_weight_views
 if TYPE_CHECKING:
     from torch.distributed import DeviceMesh
 
+
+logger = logging.getLogger(__name__)
 
 _SUPPORTED_MOONEP_VERSION = "0.0.1"
 
@@ -77,6 +80,35 @@ def _wait_event(event, stream=None) -> None:
         torch.cuda.current_stream().wait_event(event)
         return
     event.wait(stream)
+
+
+def _cuda_safe_comm_flags(
+    accelerator_type: str, enable_pdl: bool, async_finish: bool
+) -> tuple[bool, bool]:
+    """Disable CUDA comm-stream / PDL flags that SIGSEGV on Hopper.
+
+    MoonEP's dispatch epilogue is a *cooperative* launch whose grid is
+    ``num_sms_dedup`` (78 on H20). ``async_finish=True`` moves that launch
+    onto Buffer's side comm stream; ``enable_pdl=True`` additionally chains
+    it with ``griddepcontrol`` from a 32-CTA predecessor. Either combination
+    host-SIGSEGVs on CUDA. The same workload runs with both flags off.
+
+    NPU keeps the caller's flags. Set ``MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1``
+    to skip the CUDA override.
+    """
+    if accelerator_type != "cuda":
+        return bool(enable_pdl), bool(async_finish)
+    override = os.environ.get("MOONEP_ALLOW_UNSAFE_CUDA_ASYNC", "").lower()
+    if override in {"1", "true", "yes", "on"}:
+        return bool(enable_pdl), bool(async_finish)
+    if enable_pdl or async_finish:
+        logger.warning(
+            "MoonEP CUDA forces enable_pdl=0 and async_finish=0: the dispatch "
+            "epilogue is a cooperative kernel and PDL cannot run on the side "
+            "comm stream (SIGSEGV on Hopper). Set MOONEP_ALLOW_UNSAFE_CUDA_ASYNC=1 "
+            "to override."
+        )
+    return False, False
 
 
 class MoonEPRuntimeConfig(Protocol):
@@ -542,7 +574,7 @@ class MoonEPCallState:
         if self.plan is None:
             raise RuntimeError("MoonEP dispatch plan is not initialized.")
         with torch.profiler.record_function("moonep.prefetch"):
-            if self.runtime.config.async_finish:
+            if self.runtime.async_finish:
                 comm_stream = self.buffer._comm_stream
                 if comm_stream is None:
                     raise RuntimeError("MoonEP communication stream is unavailable.")
@@ -598,6 +630,9 @@ class MoonEPRuntime:
         self.config = config
         self._tokens_per_rank = config.tokens_per_rank
         self._top_k = config.top_k
+        self.enable_pdl, self.async_finish = _cuda_safe_comm_flags(
+            accelerator.type, config.enable_pdl, config.async_finish
+        )
         self.closed = False
         self._buffers: dict[tuple[int, int, int], Any] = {}
         self._projection_pools: dict[tuple[str, int, int], _ProjectionPool] = {}
@@ -668,7 +703,7 @@ class MoonEPRuntime:
                 token_padding=self.config.token_padding,
                 group=self.group,
                 comm_stream_priority=self.config.comm_stream_priority,
-                enable_pdl=self.config.enable_pdl,
+                enable_pdl=self.enable_pdl,
                 explicitly_destroy=True,
             )
             self._buffers[key] = buffer
@@ -696,17 +731,16 @@ class MoonEPRuntime:
 class _MoonEPDispatch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, route_weights, topk_experts, tokens_per_expert, state):
-        config = state.runtime.config
         with torch.profiler.record_function("moonep.dispatch.forward"):
             result = state.buffer.dispatch(
                 hidden,
                 route_weights,
                 topk_experts,
                 tokens_per_expert,
-                async_finish=config.async_finish,
+                async_finish=state.runtime.async_finish,
                 zero_copy=False,
             )
-        if config.async_finish:
+        if state.runtime.async_finish:
             dispatched_hidden, dispatched_route_weights, cu_seqlens, plan, event = result
             state.dispatch_event = event
         else:
@@ -719,7 +753,6 @@ class _MoonEPDispatch(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_dispatched_hidden, grad_dispatched_route_weights):
         state = ctx.state
-        config = state.runtime.config
         grad_dispatched_hidden = grad_dispatched_hidden.contiguous()
         grad_dispatched_route_weights = (
             grad_dispatched_route_weights.float().contiguous()
@@ -731,7 +764,7 @@ class _MoonEPDispatch(torch.autograd.Function):
                 plan=state.plan,
                 hidden_nvsh=grad_dispatched_hidden,
                 route_weights_nvs=grad_dispatched_route_weights,
-                async_finish=config.async_finish,
+                async_finish=state.runtime.async_finish,
                 zero_copy=False,
             )
         state.wait(event)
@@ -741,7 +774,6 @@ class _MoonEPDispatch(torch.autograd.Function):
 class _MoonEPWeightedCombine(torch.autograd.Function):
     @staticmethod
     def forward(ctx, expert_output, dispatched_route_weights, state):
-        config = state.runtime.config
         weighted = expert_output * dispatched_route_weights.to(
             expert_output.dtype
         ).unsqueeze(-1)
@@ -749,7 +781,7 @@ class _MoonEPWeightedCombine(torch.autograd.Function):
             output, _, event = state.buffer.combine(
                 plan=state.plan,
                 hidden_nvsh=weighted.contiguous(),
-                async_finish=config.async_finish,
+                async_finish=state.runtime.async_finish,
                 zero_copy=False,
             )
         state.wait(event)
@@ -760,15 +792,14 @@ class _MoonEPWeightedCombine(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         state = ctx.state
-        config = state.runtime.config
         with torch.profiler.record_function("moonep.combine.backward"):
             result = state.buffer.dispatch(
                 grad_output.contiguous(),
                 plan=state.plan,
-                async_finish=config.async_finish,
+                async_finish=state.runtime.async_finish,
                 zero_copy=False,
             )
-        if config.async_finish:
+        if state.runtime.async_finish:
             grad_weighted, _, _, _, event = result
             state.wait(event)
         else:
