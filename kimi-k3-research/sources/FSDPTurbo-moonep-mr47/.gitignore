@@ -1,0 +1,7 @@
+*.pyc
+.idea/
+.vscode/
+.pytest_cache/
+.codeartsdoer/
+.codemate/
+*.egg-info/
