@@ -42,6 +42,7 @@ def _projection(events, name, out_features, in_features):
         reduce_buffers=main_grad[:NUM_EXPERTS].view(
             NUM_EXPERTS // EXPERTS_PER_RANK, EXPERTS_PER_RANK, out_features, in_features
         ),
+        cuda_local_sink=False,
     )
     projection.runtime = SimpleNamespace(
         imports=SimpleNamespace(

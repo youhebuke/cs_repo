@@ -123,6 +123,23 @@ class FakeSymmetricMemory:
     def nvl_multicast_supported(self):
         return True
 
+    def create_nvl_dist_tensor(self, chunk_shape, dtype, local_rank, world_size, group=None):
+        allocation, export_handle, owned_handle = self.nvl_dist_alloc(chunk_shape, dtype)
+        self.nvl_release_mem_handle(owned_handle)
+        ranks = list(range(world_size))
+        exchanged = self.exchange_ipc_fds(
+            export_handle, ranks, local_rank, world_size, group
+        )
+        os.close(export_handle)
+        handles = [exchanged[rank] for rank in ranks]
+        try:
+            return self.nvl_dist_map(
+                chunk_shape, dtype, handles, local_rank, world_size
+            )
+        finally:
+            for handle in handles:
+                os.close(handle)
+
     # -- assertions -------------------------------------------------------
     def open_handles(self) -> List[int]:
         return sorted(handle for handle in self._live_handles if _is_open(handle))

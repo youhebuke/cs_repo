@@ -180,13 +180,33 @@ class _ProjectionPool:
         self.prefetch_allocation = allocation
         self.prefetch_export_handle = export_handle
 
-        # Reduce slots hold duplicated experts' gradients. They are allocated
-        # explicitly rather than through ``create_nvl_dist_tensor`` so the local
-        # chunk's handle can also back rows [E, E+B) of the main-grad mapping.
+        if getattr(runtime, "accelerator_type", None) == "cuda":
+            self._init_cuda_grad_buffers(chunk_shape, experts_per_rank, out_features, in_features)
+        else:
+            self._init_aliased_grad_buffers(
+                chunk_shape, experts_per_rank, out_features, in_features, ranks
+            )
+        self.owner_grad_buffers[runtime.rank].zero_()
+        self.reduce_buffers[runtime.rank].zero_()
+        self.main_grad[runtime.num_experts:].zero_()
+        dist.barrier(group=runtime.group)
+
+    def _init_aliased_grad_buffers(
+        self,
+        chunk_shape: list[int],
+        experts_per_rank: int,
+        out_features: int,
+        in_features: int,
+        ranks: list[int],
+    ) -> None:
+        """NPU: one ``[E+B]`` VMM whose tail aliases this rank's reduce pages."""
+        runtime = self.runtime
+        imports = runtime.imports
         reduce_allocation, reduce_handle, reduce_owned = imports.nvl_dist_alloc(
             shape=chunk_shape, dtype=torch.float32
         )
         imports.nvl_release_mem_handle(reduce_owned)
+        self.cuda_local_sink = False
         self.reduce_allocation = reduce_allocation
         self.reduce_export_handle = reduce_handle
         self.reduce_full = self._map_across_ranks(
@@ -212,9 +232,55 @@ class _ProjectionPool:
         self.owner_grad_buffers = self.owner_grad_full.view(
             runtime.size, experts_per_rank, out_features, in_features
         )
-        self.owner_grad_buffers[runtime.rank].zero_()
-        self.main_grad[runtime.num_experts:].zero_()
-        dist.barrier(group=runtime.group)
+
+    def _init_cuda_grad_buffers(
+        self,
+        chunk_shape: list[int],
+        experts_per_rank: int,
+        out_features: int,
+        in_features: int,
+    ) -> None:
+        """CUDA: do not ``cuMemMap`` the reduce allocation a second time.
+
+        Mapping the same POSIX handle into ``reduce_full`` and again as the
+        ``[E+B]`` tail leaves the CUDA VMM/multicast driver in a state where
+        the later Buffer planning kernel faults on ``multimem.st``. Peer ranks
+        then sit in ``cross_rank_barrier`` (phase=0, sign=1, target=0) until
+        the 100s trap. NPU aliasing is the memory win; GPU only needs the
+        same autograd graph, so the sink is a regular ``[E+B]`` tensor and
+        ``reduce_gradient`` copies into the original owner/reduce VMMs.
+        """
+        runtime = self.runtime
+        imports = runtime.imports
+        self.cuda_local_sink = True
+        self.reduce_allocation = None
+        self.reduce_export_handle = None
+        self.owner_grad_allocation = None
+        self.reduce_full = imports.create_nvl_dist_tensor(
+            chunk_shape,
+            torch.float32,
+            runtime.rank,
+            runtime.size,
+            group=runtime.group,
+        )
+        self.reduce_buffers = self.reduce_full.view(
+            runtime.size, experts_per_rank, out_features, in_features
+        )
+        self.owner_grad_full = imports.create_nvl_dist_tensor(
+            chunk_shape,
+            torch.float32,
+            runtime.rank,
+            runtime.size,
+            group=runtime.group,
+        )
+        self.owner_grad_buffers = self.owner_grad_full.view(
+            runtime.size, experts_per_rank, out_features, in_features
+        )
+        self.main_grad = torch.zeros(
+            (runtime.num_experts + experts_per_rank, out_features, in_features),
+            dtype=torch.float32,
+            device=self.reduce_full.device,
+        )
 
     def _map_across_ranks(
         self,
@@ -369,10 +435,19 @@ class MoonEPSymmetricProjection:
         experts_per_rank = self.runtime.experts_per_rank
         start = rank * experts_per_rank
         end = start + experts_per_rank
+        num_experts = self.runtime.num_experts
+
+        # On CUDA the sink is a regular [E+B] tensor. Copy the local rows into
+        # the owner/reduce VMMs before the collective kernel reads them.
+        if self.pool.cuda_local_sink:
+            self.pool.owner_grad_buffers[rank].copy_(self.pool.main_grad[start:end])
+            self.pool.reduce_buffers[rank].copy_(
+                self.pool.main_grad[num_experts:num_experts + experts_per_rank]
+            )
 
         # The grouped matmul already wrote this step's FP32 gradients into the
-        # [E+B] mapping: rows [0, E) are the owner ranks' gradients and rows
-        # [E, E+B) alias this rank's reduce slots.
+        # [E+B] buffer: rows [0, E) are the owner ranks' gradients and rows
+        # [E, E+B) are this rank's reduce slots (aliased on NPU, copied on CUDA).
         #
         # ``launch_grad_reduce`` reads every rank's reduce slots before its
         # internal cross-rank barrier. Publish the local slot writes and wait
@@ -394,7 +469,12 @@ class MoonEPSymmetricProjection:
         # The pool is reused by other layers with the same projection shape.
         # Casting back to the parameter dtype also gives autograd an
         # independent, local-sized result before the pool is overwritten.
-        return self.pool.main_grad[start:end].to(dtype=dtype)
+        reduced = (
+            self.pool.owner_grad_buffers[rank]
+            if self.pool.cuda_local_sink
+            else self.pool.main_grad[start:end]
+        )
+        return reduced.to(dtype=dtype)
 
     def close(self) -> None:
         if self.closed:
