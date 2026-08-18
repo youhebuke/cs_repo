@@ -121,6 +121,13 @@ def test_dispatch_async_finish_is_forced_off_on_cuda():
     assert moonep_adapter._dispatch_async_finish(npu_runtime) is True
 
 
+def test_prefetch_makes_experts_contiguous():
+    import inspect
+
+    src = inspect.getsource(moonep_adapter.MoonEPSymmetricProjection.prefetch)
+    assert "experts.contiguous()" in src
+
+
 def test_cuda_dispatch_and_combine_use_dispatch_async_helper():
     import inspect
 
@@ -130,3 +137,27 @@ def test_cuda_dispatch_and_combine_use_dispatch_async_helper():
     assert "_dispatch_async_finish" in combine_src
     assert "async_finish=config.async_finish" not in dispatch_src
     assert "async_finish=config.async_finish" not in combine_src
+
+
+def test_dispatcher_traces_first_layers_and_optional_debug_sync():
+    import inspect
+
+    from fsdp_turbo.distributed.expert_parallel import moonep_dispatcher
+
+    src = inspect.getsource(moonep_dispatcher.get_moonep_experts_forward_fn)
+    assert "_trace_stage" in src
+    assert "_debug_sync" in src
+    assert "before dispatch" in src
+    assert "after gmm.gate_up" in src
+
+
+def test_dispatcher_traces_first_layers_and_optional_debug_sync():
+    import inspect
+
+    from fsdp_turbo.distributed.expert_parallel import moonep_dispatcher
+
+    src = inspect.getsource(moonep_dispatcher.get_moonep_experts_forward_fn)
+    assert "_trace_stage" in src
+    assert "_debug_sync" in src
+    assert "before dispatch" in src
+    assert "after gmm.gate_up" in src

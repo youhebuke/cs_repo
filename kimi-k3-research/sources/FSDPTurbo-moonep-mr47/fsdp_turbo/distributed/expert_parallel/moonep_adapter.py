@@ -389,6 +389,8 @@ class MoonEPSymmetricProjection:
 
     def prefetch(self, plan) -> None:
         experts = plan.experts_to_copy[self.runtime.rank]
+        if not experts.is_contiguous():
+            experts = experts.contiguous()
         self.runtime.imports.launch_prefetch(
             self.full_weight[:self.runtime.num_experts],
             self.full_weight[self.runtime.num_experts:],

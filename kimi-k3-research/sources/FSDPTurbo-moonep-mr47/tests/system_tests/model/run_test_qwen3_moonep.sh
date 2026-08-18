@@ -32,6 +32,7 @@ echo "Starting Qwen3 MoE + MoonEP system test..."
 echo "  FSDP_TURBO_ROOT=${FSDP_TURBO_ROOT}"
 echo "  PYTHONPATH=${PYTHONPATH}"
 echo "  MOONEP_ASYNC_FINISH=${MOONEP_ASYNC_FINISH}"
+echo "  MOONEP_DEBUG_SYNC=${MOONEP_DEBUG_SYNC:-0}"
 echo "  dispatcher=moonep"
 echo ""
 

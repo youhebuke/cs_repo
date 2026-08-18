@@ -55,6 +55,37 @@ def test_grouped_mm_uses_torch_when_functional_missing(monkeypatch):
     torch.testing.assert_close(actual, _reference(inputs, weights, M_SPLIT))
 
 
+def test_grouped_mm_pins_last_offset_to_row_count(monkeypatch):
+    torch.manual_seed(0)
+    inputs = torch.randn(12, IN_FEATURES)
+    weights = torch.randn(3, OUT_FEATURES, IN_FEATURES)
+    monkeypatch.delattr(cuda_grouped_matmul.F, "grouped_mm", raising=False)
+    calls = []
+
+    def torch_gmm(mat_a, mat_b, offs=None, *args, **kwargs):
+        if offs is None and args:
+            offs = args[0]
+        calls.append(offs.tolist())
+        return _emulate_2d_3d(mat_a, mat_b, offs)
+
+    monkeypatch.setattr(torch, "_grouped_mm", torch_gmm, raising=False)
+
+    actual = cuda_grouped_matmul.grouped_matmul_cuda(inputs, M_SPLIT, weights)
+
+    assert calls == [[4, 4, 12]]
+    expected = _emulate_2d_3d(
+        inputs, weights.transpose(-2, -1), torch.tensor([4, 4, 12])
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_exclusive_group_ends_stays_on_device():
+    m_split = torch.tensor([4, 0, 5], dtype=torch.int32)
+    offs = cuda_grouped_matmul._exclusive_group_ends(m_split, 12)
+    assert offs.dtype == torch.int32
+    assert offs.tolist() == [4, 4, 12]
+
+
 def test_sink_writes_local_rows_without_weight_grad(monkeypatch):
     torch.manual_seed(0)
     inputs = torch.randn(9, IN_FEATURES, requires_grad=True)

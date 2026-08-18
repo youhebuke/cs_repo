@@ -421,6 +421,14 @@ def main() -> None:
 
     print(f"[probe] adapter {moonep_adapter.__file__}", flush=True)
     print(f"[probe] cuda_gmm {cuda_gmm.__file__}", flush=True)
+    print(
+        "[probe] "
+        f"F.grouped_mm={hasattr(torch.nn.functional, 'grouped_mm')} "
+        f"torch._grouped_mm={hasattr(torch, '_grouped_mm')} "
+        f"MOONEP_ASYNC_FINISH={os.environ.get('MOONEP_ASYNC_FINISH')!r} "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}",
+        flush=True,
+    )
 
     model = None
     wrapped_model = None

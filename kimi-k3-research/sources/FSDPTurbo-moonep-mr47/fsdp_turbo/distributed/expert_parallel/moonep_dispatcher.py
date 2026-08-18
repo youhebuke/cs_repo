@@ -1,9 +1,12 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Fused-expert forward implementation backed by MoonEP."""
 
+import logging
+import os
 import types
 
 import torch
+import torch.distributed as dist
 
 from fsdp_turbo.distributed.expert_parallel.moonep_adapter import (
     MoonEPRuntime,
@@ -17,6 +20,7 @@ from fsdp_turbo.distributed.expert_parallel.utils import (
 )
 from fsdp_turbo.ops.moe import grouped_matmul
 
+logger = logging.getLogger(__name__)
 
 _REQUIRED_EXPERT_ATTRIBUTES = (
     "gate_up_proj",
@@ -24,6 +28,33 @@ _REQUIRED_EXPERT_ATTRIBUTES = (
     "act_fn",
     "hidden_dim",
 )
+
+# First two expert forwards print a CPU-side stage trail. No GPU sync here:
+# synchronizing the default stream during FSDP prefetch can deadlock NCCL.
+_TRACE_REMAINING = int(os.environ.get("MOONEP_TRACE_LAYERS", "2"))
+
+
+def _debug_sync(label: str) -> None:
+    """Optional device-wide barrier used to pinpoint a native crash.
+
+    Set ``MOONEP_DEBUG_SYNC=1`` to log after dispatch, prefetch, each grouped
+    matmul, and combine. The last printed label is the stage that crashed.
+    Do not leave this on for normal training: it waits for every stream.
+    """
+    flag = os.environ.get("MOONEP_DEBUG_SYNC", "").lower()
+    if flag not in {"1", "true", "yes", "on"}:
+        return
+    torch.accelerator.synchronize()
+    logger.info("MoonEP debug sync after %s", label)
+
+
+def _trace_stage(runtime, label: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    rank = runtime.rank if runtime is not None else (
+        dist.get_rank() if dist.is_initialized() else 0
+    )
+    print(f"[moonep] rank={rank} {label}", flush=True)
 
 
 def _grouped_matmul_with_static_tail(
@@ -176,7 +207,13 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
             top_k_index.reshape(-1).long(), minlength=self.num_global_experts
         ).to(dtype=torch.int32).contiguous()
 
+        global _TRACE_REMAINING
+        trace = _TRACE_REMAINING > 0
+        if trace:
+            _TRACE_REMAINING -= 1
+
         call = runtime.new_call(tokens_per_rank, self.hidden_dim, top_k)
+        _trace_stage(runtime, "before dispatch", trace)
         dispatched, dispatched_route_weights = moonep_dispatch(
             call,
             hidden_states,
@@ -184,7 +221,11 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
             top_k_index,
             tokens_per_expert,
         )
+        _trace_stage(runtime, "after dispatch", trace)
+        _debug_sync("dispatch")
         call.prefetch(self._moonep_gate_up, self._moonep_down)
+        _trace_stage(runtime, "after prefetch", trace)
+        _debug_sync("prefetch")
 
         # Binding the parameters here, upstream of both grouped matmuls, makes
         # the cross-rank gradient reduction the last node of this layer's
@@ -199,6 +240,11 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
             call.plan,
             call.comm_context,
         )
+        _trace_stage(
+            runtime,
+            f"before gmm.gate_up NvS={dispatched.shape[0]} groups={call.cu_seqlens.numel()}",
+            trace,
+        )
         with torch.profiler.record_function("moonep.gmm.gate_up"):
             fc1 = _grouped_matmul_with_static_tail(
                 dispatched,
@@ -206,6 +252,8 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
                 self._moonep_gate_up.full_weight,
                 grad_weight_sink=self._moonep_gate_up.grad_weight_sink(),
             )
+        _trace_stage(runtime, "after gmm.gate_up", trace)
+        _debug_sync("gmm.gate_up")
         fc1 = prefetch_before_backward(fc1, self._moonep_gate_up, call)
         gate, up = fc1.chunk(2, dim=-1)
         act_limit = self.limit if hasattr(self, "limit") else None
@@ -213,6 +261,7 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
             gate = gate.clamp(max=act_limit)
             up = up.clamp(min=-act_limit, max=act_limit)
         activated = self.act_fn(gate) * up
+        _trace_stage(runtime, "before gmm.down", trace)
         with torch.profiler.record_function("moonep.gmm.down"):
             expert_output = _grouped_matmul_with_static_tail(
                 activated.contiguous(),
@@ -220,10 +269,15 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
                 self._moonep_down.full_weight,
                 grad_weight_sink=self._moonep_down.grad_weight_sink(),
             )
+        _trace_stage(runtime, "after gmm.down", trace)
+        _debug_sync("gmm.down")
         expert_output = prefetch_before_backward(expert_output, self._moonep_down, call)
+        _trace_stage(runtime, "before combine", trace)
         output = moonep_weighted_combine(
             call, expert_output, dispatched_route_weights
         )
+        _trace_stage(runtime, "after combine", trace)
+        _debug_sync("combine")
         return output.view(*hidden_shape)
 
     return moonep_experts_forward

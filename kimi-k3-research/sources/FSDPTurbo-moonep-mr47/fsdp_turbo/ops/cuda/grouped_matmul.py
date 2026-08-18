@@ -62,6 +62,22 @@ def _grouped_mm(mat_a, mat_b, offs, out_dtype=None):
     )
 
 
+def _exclusive_group_ends(m_split, row_count):
+    """Device-side group ends whose last value is exactly ``row_count``.
+
+    Do not ``.item()`` / ``.cpu()`` the offset tensor: that host sync deadlocks
+    FSDP prefetch all-gather. MoonEP's static dispatch buffer is ``[NvS, H]``;
+    ``torch._grouped_mm`` on PT 2.9 / H20 launches unspecified if
+    ``offs[-1] < NvS``. Always write the last end on device.
+    """
+    offs = torch.cumsum(m_split, dim=0).to(dtype=torch.int32)
+    if offs.numel() == 0:
+        return offs
+    offs = offs.clone()
+    offs[-1] = row_count
+    return offs
+
+
 class GroupedMatmulCUDA(torch.autograd.Function):
     """CUDA fused grouped matmul via ``_grouped_mm``.
 
@@ -77,7 +93,7 @@ class GroupedMatmulCUDA(torch.autograd.Function):
     def forward(ctx, input_tensor, weights, m_split, sink=None):
         # offs[i] marks the end of group i. Last offset must equal M (NvS):
         # stopping early (offs[-1] < NvS) crashes PT 2.9 grouped_mm on H20.
-        offs = torch.cumsum(m_split, dim=0).to(dtype=torch.int32)
+        offs = _exclusive_group_ends(m_split, input_tensor.shape[0])
 
         # out = input @ weight.T  ->  mat_b = [num_groups, K, N]
         mat_b = weights.transpose(-2, -1)
