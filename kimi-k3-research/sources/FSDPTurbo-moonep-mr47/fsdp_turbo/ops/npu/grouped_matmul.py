@@ -107,8 +107,11 @@ class GroupedMatmul(torch.autograd.Function):
         if sink is None:
             return grad, grad_weight, None, None, None, None
 
-        # Only this rank's own rows are copied into the symmetric buffer; the
-        # remaining rows are remote ranks' gradients that must stay untouched.
+        # OPT-2: npu_grouped_matmul still returns a full [E+B] wgrad (CANN
+        # has no safe out= into the symmetric mapping: that would write
+        # remote rows). Copy only this rank's owner + prefetch rows, drop
+        # the return, and skip autograd's second .grad tensor. output_dtype
+        # above avoids an extra BF16 staging + cast into FP32.
         for start, end in sink.row_ranges:
             sink.buffer[start:end].copy_(grad_weight[start:end])
         return grad, None, None, None, None, None
