@@ -79,7 +79,7 @@ MOONEP_NUM_SMS = int(os.environ.get("MOONEP_NUM_SMS", "32"))
 MOONEP_TOKEN_PADDING = int(os.environ.get("MOONEP_TOKEN_PADDING", "128"))
 # H20: async_finish=1 SIGSEGVs in CuTe compile on the comm stream. GPU
 # functional checks must set MOONEP_ASYNC_FINISH=0. NPU may keep 1.
-MOONEP_ASYNC_FINISH = os.environ.get("MOONEP_ASYNC_FINISH", "1").lower() in (
+MOONEP_ASYNC_FINISH = os.environ.get("MOONEP_ASYNC_FINISH", "0").lower() in (
     "1",
     "true",
     "yes",
@@ -342,7 +342,8 @@ def train(
             "Starting randomly initialized Qwen3 training with "
             f"MoonEP={EXPERT_PARALLEL_SIZE}, FSDP={FULLY_SHARD_PARALLEL_SIZE}, "
             f"batch_size={BATCH_SIZE}, sequence_length={MAX_LENGTH}, "
-            f"steps={NUM_STEPS}",
+            f"steps={NUM_STEPS}, async_finish={MOONEP_ASYNC_FINISH}, "
+            f"enable_pdl={MOONEP_ENABLE_PDL}",
         )
         if ENABLE_PROFILER:
             print_rank(

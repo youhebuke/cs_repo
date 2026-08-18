@@ -27,6 +27,59 @@ if TYPE_CHECKING:
 _SUPPORTED_MOONEP_VERSION = "0.0.1"
 
 
+def _is_cuda() -> bool:
+    accelerator = getattr(torch, "accelerator", None)
+    if accelerator is None:
+        return False
+    current = accelerator.current_accelerator()
+    return current is not None and current.type == "cuda"
+
+
+def _current_stream():
+    if _is_cuda():
+        return torch.cuda.current_stream()
+    return torch.accelerator.current_stream()
+
+
+def _stream_ctx(stream):
+    """Activate ``stream`` with the native CUDA/NPU context manager."""
+    if _is_cuda():
+        return torch.cuda.stream(stream)
+    return torch.accelerator.stream(stream)
+
+
+def _wait_event(event, stream=None) -> None:
+    """Wait with ``Stream.wait_event``, not ``Event.wait(accelerator stream)``.
+
+    ``Event.wait(torch.accelerator.current_stream())`` SIGSEGVs on PyTorch 2.9.
+    """
+    if event is None:
+        return
+    if stream is None:
+        stream = _current_stream()
+    wait_event = getattr(stream, "wait_event", None)
+    if callable(wait_event):
+        wait_event(event)
+        return
+    if _is_cuda():
+        torch.cuda.current_stream().wait_event(event)
+        return
+    event.wait(stream)
+
+
+def _dispatch_async_finish(runtime) -> bool:
+    """CUDA dispatch/combine stay on the compute stream.
+
+    ``Buffer.dispatch(async_finish=True)`` compiles CuTe cooperative grids on
+    the high-priority comm stream. On H20 that is an unspecified launch
+    failure; other ranks then time out in ``cross_rank_barrier``. Prefetch is
+    a non-cooperative copy and may still use ``config.async_finish``.
+    """
+    if getattr(runtime, "accelerator_type", None) == "cuda":
+        return False
+    return bool(runtime.config.async_finish)
+
+
 class MoonEPRuntimeConfig(Protocol):
     """Configuration values consumed by the MoonEP runtime."""
 
@@ -479,8 +532,7 @@ class MoonEPCallState:
         return self.buffer._require_ctx()
 
     def wait(self, event) -> None:
-        if event is not None:
-            event.wait(torch.accelerator.current_stream())
+        _wait_event(event)
 
     def prefetch(self, *projections: MoonEPSymmetricProjection) -> None:
         if self.plan is None:
@@ -490,14 +542,18 @@ class MoonEPCallState:
                 comm_stream = self.buffer._comm_stream
                 if comm_stream is None:
                     raise RuntimeError("MoonEP communication stream is unavailable.")
-                # The asynchronous dispatch is already queued on this stream;
-                # enqueue both projection prefetches behind it and make the
-                # compute stream wait for the combined event.
-                with torch.accelerator.stream(comm_stream):
+                main_stream = _current_stream()
+                recorded = [self.plan.experts_to_copy]
+                recorded.extend(projection.full_weight for projection in projections)
+                for tensor in recorded:
+                    if tensor is not None:
+                        tensor.record_stream(comm_stream)
+                comm_stream.wait_event(main_stream.record_event())
+                with _stream_ctx(comm_stream):
                     for projection in projections:
                         projection.prefetch(self.plan)
                     done = comm_stream.record_event()
-                done.wait(torch.accelerator.current_stream())
+                _wait_event(done, main_stream)
                 self.dispatch_event = None
             else:
                 for projection in projections:
@@ -632,17 +688,17 @@ class MoonEPRuntime:
 class _MoonEPDispatch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, route_weights, topk_experts, tokens_per_expert, state):
-        config = state.runtime.config
         with torch.profiler.record_function("moonep.dispatch.forward"):
+            async_finish = _dispatch_async_finish(state.runtime)
             result = state.buffer.dispatch(
                 hidden,
                 route_weights,
                 topk_experts,
                 tokens_per_expert,
-                async_finish=config.async_finish,
+                async_finish=async_finish,
                 zero_copy=False,
             )
-        if config.async_finish:
+        if async_finish:
             dispatched_hidden, dispatched_route_weights, cu_seqlens, plan, event = result
             state.dispatch_event = event
         else:
@@ -655,7 +711,6 @@ class _MoonEPDispatch(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_dispatched_hidden, grad_dispatched_route_weights):
         state = ctx.state
-        config = state.runtime.config
         grad_dispatched_hidden = grad_dispatched_hidden.contiguous()
         grad_dispatched_route_weights = (
             grad_dispatched_route_weights.float().contiguous()
@@ -667,7 +722,7 @@ class _MoonEPDispatch(torch.autograd.Function):
                 plan=state.plan,
                 hidden_nvsh=grad_dispatched_hidden,
                 route_weights_nvs=grad_dispatched_route_weights,
-                async_finish=config.async_finish,
+                async_finish=_dispatch_async_finish(state.runtime),
                 zero_copy=False,
             )
         state.wait(event)
@@ -677,7 +732,6 @@ class _MoonEPDispatch(torch.autograd.Function):
 class _MoonEPWeightedCombine(torch.autograd.Function):
     @staticmethod
     def forward(ctx, expert_output, dispatched_route_weights, state):
-        config = state.runtime.config
         weighted = expert_output * dispatched_route_weights.to(
             expert_output.dtype
         ).unsqueeze(-1)
@@ -685,7 +739,7 @@ class _MoonEPWeightedCombine(torch.autograd.Function):
             output, _, event = state.buffer.combine(
                 plan=state.plan,
                 hidden_nvsh=weighted.contiguous(),
-                async_finish=config.async_finish,
+                async_finish=_dispatch_async_finish(state.runtime),
                 zero_copy=False,
             )
         state.wait(event)
@@ -696,15 +750,15 @@ class _MoonEPWeightedCombine(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         state = ctx.state
-        config = state.runtime.config
         with torch.profiler.record_function("moonep.combine.backward"):
+            async_finish = _dispatch_async_finish(state.runtime)
             result = state.buffer.dispatch(
                 grad_output.contiguous(),
                 plan=state.plan,
-                async_finish=config.async_finish,
+                async_finish=async_finish,
                 zero_copy=False,
             )
-        if config.async_finish:
+        if async_finish:
             grad_weighted, _, _, _, event = result
             state.wait(event)
         else:

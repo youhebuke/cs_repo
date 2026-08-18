@@ -42,7 +42,11 @@ PYTHONPATH=. python3 tests/verify/verify_opt2_grad_weight_sink.py
 实验结论：
 
 - `dispatcher="moonep"`，不要 `"fused"`
-- 必须 `export MOONEP_ASYNC_FINISH=0`（`async_finish=1` 在 H20 CuTe 编译路径 SIGSEGV）
+- 必须让 CUDA `Buffer.dispatch` / `combine` 走计算流。配置里
+  `async_finish=1` 时，adapter 在 CUDA 上仍传 `async_finish=False`
+  （H20 上 comm stream 的 CuTe cooperative launch 会
+  `unspecified launch failure` + `cross_rank_barrier` 100s）。
+  `test_moonep.py` 默认 `MOONEP_ASYNC_FINISH=0`。NPU 仍尊重配置。
 - 前向 offsets 留在 GPU。`.cpu()` / 逐 expert 前向会和 FSDP prefetch 死锁，NCCL timeout 600s
 - 静态 buffer **必须** `offs[-1] == NvS`（mask + 折进最后一组）。截断 `cu_seqlens` 会 `unspecified launch failure` + `cross_rank_barrier` 100s
 - `PYTHONPATH` 必须指向本树；probe 两行应是本 checkout，不是另一份 pip/editable 安装
