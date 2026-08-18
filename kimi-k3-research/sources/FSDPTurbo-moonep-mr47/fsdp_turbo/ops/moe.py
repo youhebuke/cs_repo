@@ -13,7 +13,9 @@ __all__ = [
 ]
 
 
-def grouped_matmul(inputs, m_split, weights, use_eager=False, grad_weight_sink=None):
+def grouped_matmul(
+    inputs, m_split, weights, use_eager=False, grad_weight_sink=None, vmm_safe=False
+):
     """
     Grouped matrix multiplication with automatic device dispatch.
 
@@ -26,6 +28,9 @@ def grouped_matmul(inputs, m_split, weights, use_eager=False, grad_weight_sink=N
         grad_weight_sink: Optional :class:`GradWeightSink`. When given, the
             backward pass writes the weight gradient into the sink's buffer and
             returns no autograd gradient for ``weights``.
+        vmm_safe: When True, the CUDA backend uses per-expert ``torch.mm``
+            instead of ``F.grouped_mm``. Required for MoonEP's VMM-mapped
+            ``[E+B]`` weights; ignored on NPU/CPU.
 
     Returns:
         Result of grouped matrix multiplication
@@ -37,6 +42,7 @@ def grouped_matmul(inputs, m_split, weights, use_eager=False, grad_weight_sink=N
         m_split,
         weights,
         grad_weight_sink=grad_weight_sink,
+        vmm_safe=vmm_safe,
         device_type=device_type,
     )
 

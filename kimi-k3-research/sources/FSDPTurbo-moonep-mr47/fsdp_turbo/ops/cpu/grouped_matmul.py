@@ -42,7 +42,7 @@ class GroupedMatmulSinkCPU(torch.autograd.Function):
 
 
 @register_op('grouped_matmul', 'cpu')
-def grouped_matmul_cpu(inputs, m_split, weights, grad_weight_sink=None):
+def grouped_matmul_cpu(inputs, m_split, weights, grad_weight_sink=None, vmm_safe=False):
     """
     Grouped matrix multiplication.
 

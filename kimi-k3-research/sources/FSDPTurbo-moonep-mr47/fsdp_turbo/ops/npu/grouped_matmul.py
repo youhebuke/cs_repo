@@ -112,7 +112,7 @@ class GroupedMatmul(torch.autograd.Function):
 
 
 @register_op('grouped_matmul', 'npu')
-def grouped_matmul_npu(inputs, m_split, weights, grad_weight_sink=None):
+def grouped_matmul_npu(inputs, m_split, weights, grad_weight_sink=None, vmm_safe=False):
     if grad_weight_sink is not None:
         validate_sink(grad_weight_sink, weights)
     return GroupedMatmul.apply(inputs, weights, None, m_split, 1, grad_weight_sink)

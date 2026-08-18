@@ -1,6 +1,8 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Fused-expert forward implementation backed by MoonEP."""
 
+import logging
+import os
 import types
 
 import torch
@@ -17,6 +19,7 @@ from fsdp_turbo.distributed.expert_parallel.utils import (
 )
 from fsdp_turbo.ops.moe import grouped_matmul
 
+logger = logging.getLogger(__name__)
 
 _REQUIRED_EXPERT_ATTRIBUTES = (
     "gate_up_proj",
@@ -24,6 +27,19 @@ _REQUIRED_EXPERT_ATTRIBUTES = (
     "act_fn",
     "hidden_dim",
 )
+
+
+def _debug_sync(label: str) -> None:
+    """Optional device-wide barrier used to pinpoint a native SIGSEGV.
+
+    Set ``MOONEP_DEBUG_SYNC=1`` to log after dispatch, prefetch, each grouped
+    matmul, and combine. The last printed label is the stage that crashed.
+    """
+    flag = os.environ.get("MOONEP_DEBUG_SYNC", "").lower()
+    if flag not in {"1", "true", "yes", "on"}:
+        return
+    torch.accelerator.synchronize()
+    logger.info("MoonEP debug sync after %s", label)
 
 
 def _grouped_matmul_with_static_tail(
@@ -56,12 +72,15 @@ def _grouped_matmul_with_static_tail(
         [torch.zeros_like(cumulative_group_ends[:1]), cumulative_group_ends[:-1]]
     )
     group_sizes = cumulative_group_ends - group_starts
+    # CUDA F.grouped_mm SIGSEGVs on MoonEP's VMM-mapped [E+B] weights
+    # (Hopper TMA + many empty groups). Force the per-expert torch.mm path.
     return grouped_matmul(
         inputs,
         group_sizes,
         weights,
         use_eager=inputs.device.type == "cpu",
         grad_weight_sink=grad_weight_sink,
+        vmm_safe=True,
     )
 
 
@@ -179,7 +198,9 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
             top_k_index,
             tokens_per_expert,
         )
+        _debug_sync("dispatch")
         call.prefetch(self._moonep_gate_up, self._moonep_down)
+        _debug_sync("prefetch")
 
         # Binding the parameters here, upstream of both grouped matmuls, makes
         # the cross-rank gradient reduction the last node of this layer's
@@ -201,6 +222,7 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
                 self._moonep_gate_up.full_weight,
                 grad_weight_sink=self._moonep_gate_up.grad_weight_sink(),
             )
+        _debug_sync("gmm.gate_up")
         fc1 = prefetch_before_backward(fc1, self._moonep_gate_up, call)
         gate, up = fc1.chunk(2, dim=-1)
         act_limit = self.limit if hasattr(self, "limit") else None
@@ -215,10 +237,12 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
                 self._moonep_down.full_weight,
                 grad_weight_sink=self._moonep_down.grad_weight_sink(),
             )
+        _debug_sync("gmm.down")
         expert_output = prefetch_before_backward(expert_output, self._moonep_down, call)
         output = moonep_weighted_combine(
             call, expert_output, dispatched_route_weights
         )
+        _debug_sync("combine")
         return output.view(*hidden_shape)
 
     return moonep_experts_forward
