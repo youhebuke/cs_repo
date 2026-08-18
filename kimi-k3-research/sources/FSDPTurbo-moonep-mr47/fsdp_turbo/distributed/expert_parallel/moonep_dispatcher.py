@@ -51,11 +51,16 @@ def _grouped_matmul_with_static_tail(
     # MoonEP reserves a static communication buffer whose tail can be outside
     # the last live group. Assign the zero-filled tail to the final group so
     # every backend processes the complete tensor without a host scalar read.
+    # CUDA PT 2.9 ``torch._grouped_mm`` on H20 requires offs[-1] == NvS;
+    # stopping at cu_seqlens[-1] causes unspecified launch failure and a
+    # MoonEP cross_rank_barrier timeout. NPU npu_grouped_matmul also needs
+    # the group list to cover the full static buffer.
     cumulative_group_ends[-1] = inputs.shape[0]
     group_starts = torch.cat(
         [torch.zeros_like(cumulative_group_ends[:1]), cumulative_group_ends[:-1]]
     )
     group_sizes = cumulative_group_ends - group_starts
+    # Keep group_sizes on device. A .cpu() here deadlocks FSDP prefetch.
     return grouped_matmul(
         inputs,
         group_sizes,
