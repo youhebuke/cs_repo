@@ -10,16 +10,20 @@ class GroupedMatmulSinkCPU(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_tensor, weights, m_split, sink):
         offs = torch.cumsum(m_split, dim=0).to(torch.int64)
-        outputs = []
+        # Rows past offs[-1] are MoonEP's static tail. Keep the full NvS
+        # shape so combine/autograd stay aligned with the communication buffer.
+        output = input_tensor.new_zeros(input_tensor.shape[0], weights.shape[1])
         group_start = 0
         for group_index, group_end in enumerate(offs.tolist()):
-            outputs.append(
-                input_tensor[group_start:group_end] @ weights[group_index].transpose(0, 1)
-            )
+            if group_end > group_start:
+                output[group_start:group_end] = (
+                    input_tensor[group_start:group_end]
+                    @ weights[group_index].transpose(0, 1)
+                )
             group_start = group_end
         ctx.save_for_backward(input_tensor, weights, offs)
         ctx.sink = sink
-        return torch.cat(outputs, dim=0)
+        return output
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -28,14 +32,14 @@ class GroupedMatmulSinkCPU(torch.autograd.Function):
 
         grad_input = None
         if ctx.needs_input_grad[0]:
-            grads = []
+            grad_input = input_tensor.new_zeros(input_tensor.shape)
             group_start = 0
             for group_index, group_end in enumerate(offs.tolist()):
-                grads.append(
-                    grad_output[group_start:group_end] @ weights[group_index]
-                )
+                if group_end > group_start:
+                    grad_input[group_start:group_end] = (
+                        grad_output[group_start:group_end] @ weights[group_index]
+                    )
                 group_start = group_end
-            grad_input = torch.cat(grads, dim=0)
 
         write_group_grads(ctx.sink, grad_output, input_tensor, offs.tolist())
         return grad_input, None, None, None

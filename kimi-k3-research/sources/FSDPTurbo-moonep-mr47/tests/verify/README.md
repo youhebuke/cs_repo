@@ -103,6 +103,15 @@ prefetch all-gather 进行时把某个 rank 卡在 D2H，其余 rank 进入 NCCL
 
 `vmm_safe=True` 仍保留为逐 expert `torch.mm` 逃生舱，训练不要开。
 
+MoonEP 的静态 dispatch buffer 是 `NvS ≈ S*K` 行。把尾部折进最后一组再
+`inputs * mask`，每层 GMM 都会多一份 `[NvS, H]` 激活并留到反向。
+CUDA 路径改为按 `cu_seqlens` 计算，只在 gate_up 上 `snapshot=True`
+（dispatch buffer 跨层复用必须拷一份），down 投影不再二次 clone；
+`grouped_mm` 未写入的输出尾部就地置零。NPU 的 `npu_grouped_matmul`
+仍要求 group list 覆盖整段 buffer，因此 NPU 继续 mask + fold。
+OPT-1 的 `[E+B]` 映射是 VA，进不了 `memory_allocated`；OPT-2 省的是反向
+`empty_like([E+B])` 临时张量，相对 FSDP 全量参数峰值通常只有大约 0.5–1 GiB。
+
 ```
 [1/6] PASS  vmm_safe 前向不调用 grouped_mm, 结果与逐 expert 参考一致
 [2/6] PASS  空组被跳过, 输出对应行为 0

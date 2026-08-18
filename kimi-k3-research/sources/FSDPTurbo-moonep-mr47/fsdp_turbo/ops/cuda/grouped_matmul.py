@@ -75,6 +75,23 @@ def _grouped_mm(mat_a, mat_b, offs, out_dtype=None):
     )
 
 
+def _zero_rows_past(tensor, exclusive_end):
+    """In-place zero rows ``[exclusive_end, T)`` without a host scalar read.
+
+    ``torch._grouped_mm`` allocates the full ``[M, N]`` output with
+    ``empty_strided`` and only writes ``[:offs[-1]]``. Combine still sees the
+    NvS-sized tensor, so the static tail must be zeros rather than allocator
+    garbage. The mask is ``[M]``, not another ``[M, H]`` activation clone.
+    """
+    if tensor is None or tensor.numel() == 0:
+        return tensor
+    rows = torch.arange(
+        tensor.shape[0], device=tensor.device, dtype=exclusive_end.dtype
+    )
+    tensor.mul_((rows < exclusive_end).unsqueeze(-1).to(dtype=tensor.dtype))
+    return tensor
+
+
 def _group_ends(m_split) -> list[int]:
     """Host-side exclusive ends for each group. One D2H sync per call.
 
@@ -192,6 +209,9 @@ class GroupedMatmulCUDA(torch.autograd.Function):
         # out = input @ weight.T  ->  mat_b = [num_groups, K, N]
         mat_b = weights.transpose(-2, -1)
         output = _grouped_mm(input_tensor, mat_b, offs)
+        # grouped_mm leaves rows past offs[-1] uninitialized. Combine may
+        # still see the full NvS tensor, so zero that tail in place.
+        _zero_rows_past(output, offs[-1])
 
         ctx.save_for_backward(input_tensor, weights, offs)
         ctx.sink = sink
@@ -208,6 +228,7 @@ class GroupedMatmulCUDA(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             # grad_input = grad_output @ weight (per group).
             grad_input = _grouped_mm(grad_output, weights, offs)
+            _zero_rows_past(grad_input, offs[-1])
 
         if sink is not None:
             # OPT-2: write local rows into MoonEP's [E+B] buffer. Per-group
