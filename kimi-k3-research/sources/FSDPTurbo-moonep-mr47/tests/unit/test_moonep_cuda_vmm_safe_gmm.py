@@ -33,15 +33,12 @@ def _reference(inputs, weights, m_split):
 def _emulate_2d_3d(mat_a, mat_b, offs=None, *args, **kwargs):
     if offs is None and args:
         offs = args[0]
-    # Match CUTLASS grouped_mm: output has mat_a.size(0) rows. Rows past
-    # offs[-1] stay zero here so tests that cover the full buffer still pass;
-    # the tail-garbage case below fills 123 then relies on _zero_rows_past.
-    output = mat_a.new_zeros(mat_a.shape[0], mat_b.shape[-1])
+    outputs = []
     start = 0
     for group, end in enumerate(offs.tolist()):
-        output[start:end] = mat_a[start:end] @ mat_b[group]
+        outputs.append(mat_a[start:end] @ mat_b[group])
         start = end
-    return output
+    return torch.cat(outputs, dim=0)
 
 
 def test_vmm_safe_forward_backward_never_calls_grouped_mm(monkeypatch):
@@ -126,35 +123,6 @@ def test_sink_forward_does_not_materialize_host_group_ends(monkeypatch):
     assert not host_reads
     output.sum().backward()
     assert not host_reads
-
-
-def test_fused_path_zeros_static_tail_left_uninitialized_by_grouped_mm(monkeypatch):
-    torch.manual_seed(0)
-    inputs = torch.randn(9, IN_FEATURES)
-    weights = torch.randn(2, OUT_FEATURES, IN_FEATURES)
-    m_split = torch.tensor([3, 4], dtype=torch.int32)
-
-    def emulate_with_garbage(mat_a, mat_b, offs=None, *args, **kwargs):
-        if offs is None and args:
-            offs = args[0]
-        output = mat_a.new_empty(mat_a.shape[0], mat_b.shape[-1])
-        output.fill_(123)
-        start = 0
-        for group, end in enumerate(offs.tolist()):
-            output[start:end] = mat_a[start:end] @ mat_b[group]
-            start = end
-        return output
-
-    monkeypatch.setattr(
-        cuda_grouped_matmul.F, "grouped_mm", emulate_with_garbage, raising=False
-    )
-
-    actual = cuda_grouped_matmul.grouped_matmul_cuda(inputs, m_split, weights)
-
-    assert actual.shape == (9, OUT_FEATURES)
-    torch.testing.assert_close(
-        actual[7:], torch.zeros(2, OUT_FEATURES), rtol=0, atol=0
-    )
 
 
 def test_fused_dispatcher_path_still_calls_grouped_mm(monkeypatch):

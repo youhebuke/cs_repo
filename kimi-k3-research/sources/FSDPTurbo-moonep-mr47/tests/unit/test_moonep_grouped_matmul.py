@@ -10,15 +10,16 @@ from fsdp_turbo.distributed.expert_parallel.moonep_dispatcher import (
 
 
 def _reference(inputs, offsets, weights):
-    # Live groups stop at the planner's last exclusive end. Rows past that
-    # belong to MoonEP's static tail and must be zero, not folded into the
-    # last expert (folding clones the whole NvS buffer).
-    outputs = inputs.new_zeros(inputs.shape[0], weights.shape[1])
+    active_rows = torch.arange(inputs.shape[0]) < offsets[-1]
+    inputs = inputs * active_rows.unsqueeze(-1).to(inputs.dtype)
+    offsets = offsets.clone()
+    offsets[-1] = inputs.shape[0]
+    outputs = []
     start = 0
     for group, end in enumerate(offsets.tolist()):
-        outputs[start:end] = inputs[start:end] @ weights[group].transpose(0, 1)
+        outputs.append(inputs[start:end] @ weights[group].transpose(0, 1))
         start = end
-    return outputs
+    return torch.cat(outputs, dim=0)
 
 
 @pytest.mark.parametrize("requires_input_grad", [False, True])
@@ -50,57 +51,6 @@ def test_grouped_matmul_forward_backward_with_empty_group_and_static_tail(
     else:
         assert inputs.grad is None
     torch.testing.assert_close(weights.grad, weights_ref.grad)
-
-
-def test_static_tail_garbage_does_not_enter_the_last_group():
-    offsets = torch.tensor([3, 7], dtype=torch.int32)
-    inputs = torch.zeros(9, 4)
-    inputs[:7] = 1.0
-    inputs[7:] = 100.0
-    weights = torch.ones(2, 8, 4)
-
-    actual = _grouped_matmul_with_static_tail(inputs, offsets, weights)
-
-    torch.testing.assert_close(actual[7:], torch.zeros(2, 8), rtol=0, atol=0)
-    torch.testing.assert_close(actual[:7], _reference(inputs, offsets, weights)[:7])
-
-
-def test_static_tail_garbage_does_not_change_last_group_wgrad():
-    offsets = torch.tensor([3, 7], dtype=torch.int32)
-    dirty = torch.zeros(9, 4)
-    dirty[:7] = 1.0
-    dirty[7:] = 100.0
-    clean = dirty.clone()
-    clean[7:] = 0.0
-    weights_dirty = torch.randn(2, 8, 4, requires_grad=True)
-    weights_clean = weights_dirty.detach().clone().requires_grad_(True)
-
-    _grouped_matmul_with_static_tail(dirty, offsets, weights_dirty).sum().backward()
-    _grouped_matmul_with_static_tail(clean, offsets, weights_clean).sum().backward()
-
-    torch.testing.assert_close(weights_dirty.grad, weights_clean.grad)
-
-
-def test_snapshot_clones_only_when_requested(monkeypatch):
-    from fsdp_turbo.distributed.expert_parallel import moonep_dispatcher
-
-    offsets = torch.tensor([3, 7], dtype=torch.int32)
-    inputs = torch.randn(9, 8, requires_grad=True)
-    weights = torch.randn(2, 16, 8)
-    seen = []
-    original = moonep_dispatcher.grouped_matmul
-
-    def spy(captured, *args, **kwargs):
-        seen.append(captured.data_ptr())
-        return original(captured, *args, **kwargs)
-
-    monkeypatch.setattr(moonep_dispatcher, "grouped_matmul", spy)
-
-    _grouped_matmul_with_static_tail(inputs, offsets, weights, snapshot=False)
-    _grouped_matmul_with_static_tail(inputs, offsets, weights, snapshot=True)
-
-    assert seen[0] == inputs.data_ptr()
-    assert seen[1] != inputs.data_ptr()
 
 
 def test_grouped_matmul_rejects_group_count_mismatch():

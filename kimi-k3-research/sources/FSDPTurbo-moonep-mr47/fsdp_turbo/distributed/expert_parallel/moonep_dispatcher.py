@@ -47,44 +47,36 @@ def _grouped_matmul_with_static_tail(
     cumulative_group_ends: torch.Tensor,
     weights: torch.Tensor,
     grad_weight_sink=None,
-    snapshot=False,
 ) -> torch.Tensor:
-    """Run the common grouped matmul over MoonEP's static communication buffer.
-
-    ``snapshot=True`` clones ``inputs`` because MoonEP reuses the dispatch
-    buffer across layers. Down-projection activations already have private
-    storage; cloning them again was a full ``[NvS, H']`` copy per layer.
-    """
+    """Run the common grouped matmul over MoonEP's static communication buffer."""
     if cumulative_group_ends.numel() != weights.shape[0]:
         raise RuntimeError(
             f"MoonEP provided {cumulative_group_ends.numel()} groups but the "
             f"projection contains {weights.shape[0]} weight groups."
         )
 
-    # Keep the planner's exclusive ends on CUDA/CPU. Do not rewrite the last
-    # end to NvS and do not multiply the whole dispatch buffer to zero the
-    # static tail: that clone is [NvS, H] per GMM (~64-170 MiB at Qwen3-30B
-    # S=4196 K=8) and is saved until backward, so it inflates peak_memory.
-    # CUDA grouped_mm only reads [:cu_seqlens[-1]]; the CUDA op zeros unused
-    # output rows. A .cpu() here still deadlocks FSDP prefetch all-gather.
-    if snapshot:
-        inputs = inputs.clone()
-    cumulative_group_ends = cumulative_group_ends.to(dtype=torch.int32).contiguous()
-    if inputs.device.type == "npu":
-        # npu_grouped_matmul requires the group list to cover every row of
-        # the static buffer. Zero the tail first so folding it into the last
-        # expert cannot pollute that expert's wgrad.
-        cumulative_group_ends = cumulative_group_ends.clone()
-        live = (
-            torch.arange(inputs.shape[0], device=inputs.device)
-            < cumulative_group_ends[-1]
-        )
-        inputs = inputs * live.unsqueeze(-1).to(inputs.dtype)
-        cumulative_group_ends[-1] = inputs.shape[0]
+    cumulative_group_ends = cumulative_group_ends.to(
+        dtype=torch.int32
+    ).contiguous().clone()
+    active_rows = (
+        torch.arange(inputs.shape[0], device=inputs.device)
+        < cumulative_group_ends[-1]
+    )
+    inputs = inputs * active_rows.unsqueeze(-1).to(inputs.dtype)
+
+    # MoonEP reserves a static communication buffer whose tail can be outside
+    # the last live group. Assign the zero-filled tail to the final group so
+    # every backend processes the complete tensor without a host scalar read.
+    cumulative_group_ends[-1] = inputs.shape[0]
     group_starts = torch.cat(
         [torch.zeros_like(cumulative_group_ends[:1]), cumulative_group_ends[:-1]]
     )
     group_sizes = cumulative_group_ends - group_starts
+    # Keep ``group_sizes`` on device. The CUDA backend runs ``cumsum`` +
+    # ``torch._grouped_mm`` / ``aten._grouped_mm`` (PyTorch 2.9 has no
+    # ``F.grouped_mm``). A ``.cpu()`` here deadlocks FSDP prefetch all-gather.
+    # Do not pass ``vmm_safe=True``: that path D2Hs group ends for a Python
+    # ``torch.mm`` loop and hits the same hang.
     return grouped_matmul(
         inputs,
         group_sizes,
@@ -231,7 +223,6 @@ def get_moonep_experts_forward_fn(runtime: MoonEPRuntime, fixed_router=False):
                 call.cu_seqlens,
                 self._moonep_gate_up.full_weight,
                 grad_weight_sink=self._moonep_gate_up.grad_weight_sink(),
-                snapshot=True,
             )
         _debug_sync("gmm.gate_up")
         fc1 = prefetch_before_backward(fc1, self._moonep_gate_up, call)
